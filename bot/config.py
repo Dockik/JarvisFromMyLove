@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     @property
     def webhook_path(self) -> str:
-        return f"/webhook/{self.webhook_secret}"
+        return "/telegram/webhook"
 
     @property
     def webhook_url(self) -> str:
