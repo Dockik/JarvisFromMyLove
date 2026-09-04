@@ -13,8 +13,11 @@ from .config import get_tz, settings
 
 log = logging.getLogger(__name__)
 
-client = genai.Client(api_key=settings.gemini_api_key)
-MODEL = "gemini-2.5-flash"
+client = genai.Client(
+    api_key=settings.gemini_api_key,
+    http_options=types.HttpOptions(timeout=30_000),
+)
+MODEL = "gemini-3.6-flash"
 
 
 class ParsedIntent(BaseModel):
