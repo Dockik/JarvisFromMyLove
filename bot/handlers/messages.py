@@ -95,7 +95,7 @@ def _preview(intent: ParsedIntent, tzname: str) -> str:
 async def on_text(message: Message) -> None:
     async with SessionLocal() as session:
         user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
-    await message.answer_chat_action("typing")
+    await message.bot.send_chat_action(message.chat.id, "typing")
     try:
         intent = await parse_text(message.text, user.tz)
     except Exception:
@@ -109,7 +109,7 @@ async def on_text(message: Message) -> None:
 async def on_voice(message: Message) -> None:
     async with SessionLocal() as session:
         user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
-    await message.answer_chat_action("typing")
+    await message.bot.send_chat_action(message.chat.id, "typing")
     voice = message.voice or message.audio_note
     file = await message.bot.get_file(voice.file_id)
     buf = await message.bot.download_file(file.file_path)
