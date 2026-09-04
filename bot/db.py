@@ -26,11 +26,21 @@ from .config import settings
 
 
 def _norm_url(url: str) -> str:
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url
+    parts = urlsplit(url)
+    query = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        if key == "sslmode":
+            key = "ssl"
+        elif key == "channel_binding":
+            continue  # asyncpg не поддерживает
+        query.append((key, value))
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 engine = create_async_engine(_norm_url(settings.database_url), pool_pre_ping=True)
