@@ -37,6 +37,7 @@ async def on_startup() -> None:
             settings.webhook_url,
             allowed_updates=dp.resolve_used_update_types(),
             drop_pending_updates=True,
+            secret_token=settings.webhook_secret,
         )
         log.info("Webhook set: %s", settings.webhook_url)
     else:
@@ -60,7 +61,11 @@ async def health() -> dict:
 async def webhook(request: Request) -> dict:
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if settings.base_url and secret != settings.webhook_secret:
+        log.warning("Webhook request with bad secret rejected")
         raise HTTPException(status_code=403, detail="Bad secret")
-    update = Update.model_validate(await request.json(), context={"bot": bot})
-    await dp.feed_update(bot, update)
+    try:
+        update = Update.model_validate(await request.json(), context={"bot": bot})
+        await dp.feed_update(bot, update)
+    except Exception:
+        log.exception("Failed to process update")
     return {"ok": True}
