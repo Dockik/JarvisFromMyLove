@@ -11,11 +11,13 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .config import get_tz
-from .db import Event, ReminderLog, SessionLocal, User
-from .keyboards import event_actions
+from .db import Event, Goal, ReminderLog, SessionLocal, Subtask, User
+from .keyboards import event_actions, subtask_done_kb
 from .views import today_view
 
 log = logging.getLogger(__name__)
+
+WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
 def _aware(dt: datetime) -> datetime:
@@ -92,10 +94,73 @@ def _digest_kb() -> InlineKeyboardMarkup:
     )
 
 
+async def check_goal_subtasks(bot: Bot) -> None:
+    """Напоминания подзадач цели в выбранный день/время + автопродление недельного плана."""
+    async with SessionLocal() as session:
+        rows = list(
+            await session.execute(
+                select(Subtask, Goal, User)
+                .join(Goal, Subtask.goal_id == Goal.id)
+                .join(User, Subtask.user_id == User.id)
+                .where(Subtask.done.is_(False), Goal.done.is_(False))
+            )
+        )
+        now_utc = datetime.now(timezone.utc)
+        regen: list[tuple[Goal, User]] = []
+        for sub, goal, user in rows:
+            local_now = datetime.now(get_tz(user.tz))
+            if sub.weekday != local_now.weekday():
+                continue
+            if sub.time_str > local_now.strftime("%H:%M"):
+                continue
+            if sub.last_reminded_on == local_now.date():
+                continue
+            sub.last_reminded_on = local_now.date()
+            try:
+                await bot.send_message(
+                    user.tg_id,
+                    f"🎯 Цель «{goal.title}»:\n<b>{sub.title}</b>",
+                    reply_markup=subtask_done_kb(sub.id),
+                )
+            except Exception:
+                log.exception("Subtask reminder failed for %s", user.tg_id)
+            # План недели истёк? Планируем автопродление (раз в день)
+            if (
+                goal.plan_expires_at is not None
+                and _aware(goal.plan_expires_at) < now_utc
+                and goal.plan_gen_on != local_now.date()
+            ):
+                goal.plan_gen_on = local_now.date()
+                regen.append((goal, user))
+        await session.commit()
+
+    for goal, user in regen:
+        await _regen_goal_plan(bot, goal.id, user.tg_id)
+
+
+async def _regen_goal_plan(bot: Bot, goal_id: int, tg_id: int) -> None:
+    from .goalplan import create_goal_plan
+
+    async with SessionLocal() as session:
+        user = await session.scalar(select(User).where(User.tg_id == tg_id))
+        goal = await session.get(Goal, goal_id)
+        if user is None or goal is None or goal.done:
+            return
+        try:
+            await bot.send_message(tg_id, f"🔄 Неделя по цели «{goal.title}» закончилась — обновляю план…")
+            text = await create_goal_plan(session, user, goal)
+        except Exception:
+            log.exception("Goal auto-replan failed")
+            await bot.send_message(tg_id, "Не смог обновить план — скажите «обнови план», и я повторю.")
+            return
+    await bot.send_message(tg_id, text)
+
+
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=timezone.utc)
     scheduler.add_job(check_reminders, "interval", seconds=60, args=[bot], id="reminders")
     scheduler.add_job(check_digests, "interval", seconds=60, args=[bot], id="digests")
+    scheduler.add_job(check_goal_subtasks, "interval", seconds=60, args=[bot], id="goal_subtasks")
     scheduler.start()
     log.info("Scheduler started")
     return scheduler

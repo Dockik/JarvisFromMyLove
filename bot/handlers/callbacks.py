@@ -5,8 +5,9 @@ import logging
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
-from ..db import Event, Goal, ReminderLog, SessionLocal, Task, User, get_or_create_user
-from ..keyboards import MAIN_MENU, TIMEZONES, settings_menu
+from ..db import Event, Goal, ReminderLog, SessionLocal, Subtask, Task, User, get_or_create_user
+from ..goalplan import create_goal_plan, goal_card_text
+from ..keyboards import MAIN_MENU, TIMEZONES, goal_folder, settings_menu
 from ..pending import pop_group
 from ..views import goals_view, save_intent, tasks_view, today_view
 
@@ -17,6 +18,7 @@ router = Router()
 @router.callback_query(F.data.startswith("view:"))
 async def on_view(cb: CallbackQuery) -> None:
     action = cb.data.split(":", 1)[1]
+    kb = MAIN_MENU
     async with SessionLocal() as session:
         user = await get_or_create_user(session, cb.from_user.id, cb.from_user.username)
         if action == "today":
@@ -24,7 +26,7 @@ async def on_view(cb: CallbackQuery) -> None:
         elif action == "tasks":
             text = await tasks_view(session, user)
         elif action == "goals":
-            text = await goals_view(session, user)
+            text, kb = await goals_view(session, user)
         elif action == "settings":
             await cb.message.edit_reply_markup(reply_markup=settings_menu(user.tz))
             await cb.answer()
@@ -33,7 +35,7 @@ async def on_view(cb: CallbackQuery) -> None:
             await cb.message.edit_reply_markup(reply_markup=MAIN_MENU)
             await cb.answer()
             return
-    await cb.message.edit_text(text, reply_markup=MAIN_MENU)
+    await cb.message.edit_text(text, reply_markup=kb or MAIN_MENU)
     await cb.answer()
 
 
@@ -56,9 +58,34 @@ async def on_confirm(cb: CallbackQuery) -> None:
         return
     async with SessionLocal() as session:
         user = await get_or_create_user(session, cb.from_user.id, cb.from_user.username)
-        lines = [await save_intent(session, user, intent) for intent in group.intents]
+        created: list = []
+        lines = [
+            await save_intent(session, user, intent, created_goals=created)
+            for intent in group.intents
+        ]
     await cb.message.edit_text("\n".join(lines))
     await cb.answer("Сохранено ✅")
+    await _spawn_goal_plans(cb.message, created, group.text)
+
+
+async def _spawn_goal_plans(message, goals: list, context: str) -> None:
+    """После подтверждения цели тихо формирует недельный план и присылает карточку."""
+    from ..keyboards import goal_folder
+
+    for g in goals:
+        await message.answer("⏳ Формирую план по цели «%s»…" % g.title)
+        try:
+            async with SessionLocal() as session:
+                user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
+                goal = await session.get(Goal, g.id)
+                if goal is None:
+                    continue
+                text = await create_goal_plan(session, user, goal, context)
+        except Exception:
+            log.exception("Goal plan generation failed")
+            await message.answer("Не смог составить план — нажмите «🔄 Новый план» позже.")
+            continue
+        await message.answer(text, reply_markup=goal_folder(g.id))
 
 
 # ---------- Действия над существующими ----------
@@ -86,6 +113,60 @@ async def on_object_action(cb: CallbackQuery) -> None:
         await session.commit()
     await cb.message.edit_reply_markup(reply_markup=None)
     await cb.answer(text)
+
+
+# ---------- Папка цели, план, подзадачи ----------
+
+@router.callback_query(F.data.regexp(r"^gopen:(\d+)$"))
+async def on_goal_open(cb: CallbackQuery) -> None:
+    goal_id = int(cb.data.split(":")[1])
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, cb.from_user.id, cb.from_user.username)
+        goal = await session.get(Goal, goal_id)
+        if goal is None or goal.user_id != user.id:
+            await cb.answer("Цель не найдена", show_alert=True)
+            return
+        text = await goal_card_text(session, goal, user)
+    try:
+        await cb.message.edit_text(text, reply_markup=goal_folder(goal_id))
+    except Exception:
+        await cb.message.answer(text, reply_markup=goal_folder(goal_id))
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^gplan:(\d+)$"))
+async def on_goal_replan(cb: CallbackQuery) -> None:
+    goal_id = int(cb.data.split(":")[1])
+    await cb.answer("Формирую новый план… ⏳")
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, cb.from_user.id, cb.from_user.username)
+        goal = await session.get(Goal, goal_id)
+        if goal is None or goal.user_id != user.id:
+            return
+        try:
+            text = await create_goal_plan(session, user, goal)
+        except Exception:
+            log.exception("Goal replan failed")
+            await cb.message.answer("Не смог составить план, попробуйте ещё раз 🙏")
+            return
+    try:
+        await cb.message.edit_text(text, reply_markup=goal_folder(goal_id))
+    except Exception:
+        await cb.message.answer(text, reply_markup=goal_folder(goal_id))
+
+
+@router.callback_query(F.data.regexp(r"^sb:done:(\d+)$"))
+async def on_subtask_done(cb: CallbackQuery) -> None:
+    sub_id = int(cb.data.split(":")[1])
+    async with SessionLocal() as session:
+        sub = await session.get(Subtask, sub_id)
+        if sub is None:
+            await cb.answer("Уже неактуально", show_alert=True)
+            return
+        sub.done = True
+        await session.commit()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.answer("Сделано! 💪")
 
 
 # ---------- Настройки ----------

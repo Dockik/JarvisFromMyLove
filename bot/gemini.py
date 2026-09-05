@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, Optional
 
 from google import genai
@@ -52,6 +52,115 @@ class ParsedMessage(BaseModel):
     answer: Optional[str] = None
     # Контроль арифметики времени: какой «сейчас» использовала модель
     now_assumed: Optional[str] = None
+
+
+GOAL_PLAN_PROMPT = """Ты — личный коуч-ассистент. Пользователь поставил цель, составь ему ПЛАН НА БЛИЖАЙШУЮ НЕДЕЛЮ.
+Верни JSON:
+- plan: текст плана на неделю на русском (2-6 коротких пунктов, конкретные действия, \
+без приветствий; можно Markdown-жирный для заголовка). Учитывай контекст пользователя.
+- subtasks: 2-5 подзадач-напоминаний на конкретные дни недели: weekday (0=Пн..6=Вс), \
+time "ЧЧ:ММ" (разумное время, 8:00-21:00), title — короткое действие.
+
+Цель: {title}
+Дедлайн: {target}
+Контекст пользователя (дополнительные детали из его сообщения): {context}
+Текущая дата: {now}, таймзона: {tz}. Планируй дни, которые ещё впереди на этой неделе."""
+
+
+async def generate_goal_plan(
+    title: str, context: str, target_date: date | None, user_tz: str
+) -> "GoalPlan":
+    from pydantic import BaseModel as _BM
+
+    class SubtaskPlan(_BM):
+        title: str
+        weekday: int
+        time: str = "18:00"
+
+    class GoalPlanModel(_BM):
+        plan: str
+        subtasks: list[SubtaskPlan] = []
+
+    target = target_date.strftime("%d.%m.%Y") if target_date else "не указан"
+    user_msg = GOAL_PLAN_PROMPT.format(
+        title=title,
+        target=target,
+        context=context or "нет",
+        now=_now_str(user_tz),
+        tz=user_tz,
+    )
+    if giga.enabled():
+        try:
+            data = await giga.chat_json(user_msg, "Составь план недели по схеме.")
+            parsed = GoalPlanModel.model_validate(data)
+            return _sanitize_plan(parsed, user_tz)
+        except Exception:
+            log.warning("GigaChat goal plan failed, fallback to Gemini", exc_info=True)
+    last_exc: Exception | None = None
+    for model in MODEL_CHAIN:
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model,
+                contents=user_msg,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=GoalPlanModel,
+                    temperature=0.4,
+                ),
+            )
+            return _sanitize_plan(
+                GoalPlanModel.model_validate(json.loads(resp.text or "{}")), user_tz
+            )
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            if _is_retryable(e):
+                log.warning("Gemini plan %s failed (%s)", model, getattr(e, "code", None))
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
+def _sanitize_plan(parsed, user_tz: str):
+    """Нормализует подзадачи: валидные weekday/time, только будущие дни недели."""
+    from pydantic import BaseModel as _BM
+
+    class SubtaskPlan(_BM):
+        title: str
+        weekday: int
+        time: str = "18:00"
+
+    class GoalPlan(_BM):
+        plan: str
+        subtasks: list[SubtaskPlan] = []
+
+    tz = get_tz(user_tz)
+    now = datetime.now(tz)
+    out = []
+    for s in parsed.subtasks:
+        wd = s.weekday if 0 <= s.weekday <= 6 else 0
+        t = s.time or "18:00"
+        try:
+            h, m = map(int, t.split(":"))
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError
+            t = f"{h:02d}:{m:02d}"
+        except ValueError:
+            t = "18:00"
+        # Пропускаем дни недели, которые на этой неделе уже прошли (после текущего времени)
+        days_ahead = (wd - now.weekday()) % 7
+        if days_ahead == 0:
+            try:
+                hh, mm = map(int, t.split(":"))
+                if (hh, mm) <= (now.hour, now.minute):
+                    continue
+            except ValueError:
+                pass
+        elif days_ahead > 6:
+            continue
+        if s.title and s.title.strip():
+            out.append(SubtaskPlan(title=s.title.strip()[:200], weekday=wd, time=t))
+    return GoalPlan(plan=parsed.plan or "", subtasks=out)
 
 
 SYSTEM_PROMPT = """Ты — мозг личного ассистента «Джарвис» в Telegram. Пользователь пишет по-русски \

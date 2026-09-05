@@ -5,6 +5,8 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aiogram.types import InlineKeyboardMarkup
+
 from .config import get_tz
 from .db import Event, Goal, ReminderLog, Task, User
 
@@ -103,22 +105,24 @@ async def tasks_view(session: AsyncSession, user: User) -> str:
     return "✅ <b>Активные задачи:</b>\n" + "\n".join(fmt_task(t, user.tz) for t in tasks)
 
 
-async def goals_view(session: AsyncSession, user: User) -> str:
+async def goals_view(session: AsyncSession, user: User) -> tuple[str, InlineKeyboardMarkup | None]:
+    from .keyboards import goals_kb
+
     goals = list(
         await session.scalars(
             select(Goal).where(Goal.user_id == user.id, Goal.done.is_(False))
         )
     )
     if not goals:
-        return "Целей пока нет. Расскажите, к чему стремитесь — я запомню!"
-    lines = ["🎯 <b>Цели:</b>"]
+        return "Целей пока нет. Расскажите, к чему стремитесь — я запомню!", None
+    lines = ["🎯 <b>Цели:</b>\nНажмите на цель, чтобы открыть её план 👇"]
     for g in goals:
         target = f" (до {g.target_date.strftime('%d.%m.%Y')})" if g.target_date else ""
         lines.append(f"• {g.title}{target}")
-    return "\n".join(lines)
+    return "\n".join(lines), goals_kb([(g.id, g.title) for g in goals])
 
 
-async def save_intent(session: AsyncSession, user: User, intent) -> str:
+async def save_intent(session: AsyncSession, user: User, intent, created_goals: list | None = None) -> str:
     """Сохраняет распознанное действие в БД. Возвращает строку-отчёт для чата."""
     if intent.intent == "add_event":
         dt = None
@@ -171,6 +175,8 @@ async def save_intent(session: AsyncSession, user: User, intent) -> str:
         gl = Goal(user_id=user.id, title=intent.title or "Цель", target_date=td)
         session.add(gl)
         await session.commit()
+        if created_goals is not None:
+            created_goals.append(gl)
         return f"🎯 Цель записана: <b>{gl.title}</b>"
 
     return f"⚠️ Не понял, что сохранять ({intent.intent})."

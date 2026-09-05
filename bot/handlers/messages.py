@@ -238,14 +238,20 @@ async def _confirm_pending(message: Message) -> None:
     groups = chat_groups(message.chat.id)
     if not groups:
         return
+    created: list = []
+    contexts: list[str] = []
     async with SessionLocal() as session:
         user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
         lines: list[str] = []
         for key, group in groups:
             for intent in group.intents:
-                lines.append(await save_intent(session, user, intent))
+                lines.append(await save_intent(session, user, intent, created_goals=created))
+            contexts.append(group.text)
             pop_group(key)
     await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
+    from .callbacks import _spawn_goal_plans
+
+    await _spawn_goal_plans(message, created, " ".join(contexts))
 
 
 async def _cancel_pending(message: Message) -> None:

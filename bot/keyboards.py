@@ -59,6 +59,37 @@ def goal_actions(goal_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def goal_folder(goal_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Новый план", callback_data=f"gplan:{goal_id}")],
+            [
+                InlineKeyboardButton(text="✅ Достигнута", callback_data=f"gl:done:{goal_id}"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"gl:del:{goal_id}"),
+            ],
+            [InlineKeyboardButton(text="◀️ К целям", callback_data="view:goals")],
+        ]
+    )
+
+
+def goals_kb(openable: list[tuple[int, str]]) -> InlineKeyboardMarkup | None:
+    """Кнопки-«папки» для каждой цели."""
+    if not openable:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"📂 {title[:28]}", callback_data=f"gopen:{gid}")]
+            for gid, title in openable
+        ]
+    )
+
+
+def subtask_done_kb(sub_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✔️ Сделано", callback_data=f"sb:done:{sub_id}")]]
+    )
+
+
 DIGEST_TIMES = ["06:00", "07:00", "08:00", "09:00"]
 TIMEZONES = {
     "Europe/Moscow": "Москва (UTC+3)",

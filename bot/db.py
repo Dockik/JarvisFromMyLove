@@ -100,6 +100,23 @@ class Goal(Base):
     title: Mapped[str] = mapped_column(String(255))
     target_date: Mapped[date | None] = mapped_column(nullable=True)
     progress: Mapped[int] = mapped_column(Integer, default=0)
+    plan: Mapped[str | None] = mapped_column(Text, nullable=True)
+    plan_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    plan_gen_on: Mapped[date | None] = mapped_column(nullable=True)
+    done: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Subtask(Base):
+    __tablename__ = "subtasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    goal_id: Mapped[int] = mapped_column(ForeignKey("goals.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(255))
+    weekday: Mapped[int] = mapped_column(Integer)  # 0=Пн .. 6=Вс
+    time_str: Mapped[str] = mapped_column(String(5), default="18:00")
+    last_reminded_on: Mapped[date | None] = mapped_column(nullable=True)
     done: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -119,6 +136,12 @@ class ReminderLog(Base):
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Лёгкая миграция существующей таблицы goals (create_all не добавляет колонки)
+        from sqlalchemy import text
+
+        await conn.execute(text("ALTER TABLE goals ADD COLUMN IF NOT EXISTS plan TEXT"))
+        await conn.execute(text("ALTER TABLE goals ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ"))
+        await conn.execute(text("ALTER TABLE goals ADD COLUMN IF NOT EXISTS plan_gen_on DATE"))
 
 
 async def get_or_create_user(session: AsyncSession, tg_id: int, username: str | None) -> User:
