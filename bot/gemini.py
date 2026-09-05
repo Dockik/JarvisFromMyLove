@@ -21,6 +21,17 @@ client = genai.Client(
 )
 
 
+class SubtaskPlan(BaseModel):
+    title: str
+    weekday: int
+    time: str = "18:00"
+
+
+class GoalPlan(BaseModel):
+    plan: str
+    subtasks: list[SubtaskPlan] = []
+
+
 class ParsedIntent(BaseModel):
     """Одно действие из сообщения."""
 
@@ -55,48 +66,77 @@ class ParsedMessage(BaseModel):
     now_assumed: Optional[str] = None
 
 
-GOAL_PLAN_PROMPT = """Ты — личный коуч-ассистент. Пользователь поставил цель, составь ему ПЛАН НА БЛИЖАЙШУЮ НЕДЕЛЮ.
-Верни JSON:
-- plan: текст плана на неделю на русском (2-6 коротких пунктов, конкретные действия, \
-без приветствий; можно Markdown-жирный для заголовка). Учитывай контекст пользователя.
-- subtasks: 2-5 подзадач-напоминаний на конкретные дни недели: weekday (0=Пн..6=Вс), \
-time "ЧЧ:ММ" (разумное время, 8:00-21:00), title — короткое действие.
+PLAN_RULES = """Ты — личный коуч-ассистент. Пользователь поставил цель. Составь КОНКРЕТНЫЙ план \
+на ближайшую неделю — готовый к исполнению «из коробки», а не общие советы.
+
+Жёсткие правила:
+- Используй КАЖДУЮ деталь из контекста пользователя (цифры, ограничения, предпочтения) — это требования, а не фон.
+- Каждый пункт — конкретное действие: не «сбалансированное меню на 1500 ккал», а \
+«Пн: завтрак — омлет из 3 яиц + овсянка 60 г (~450 ккал); обед — куриная грудка 150 г + гречка + овощи (~550 ккал)». \
+Не «занимайся языком», а «Пн: урок 1 — 50 базовых слов, 40 минут».
+- План ПО ДНЯМ недели: «Пн: …», «Вт: …» … Для диет — меню по приёмам пищи с блюдами и калориями; \
+для обучения — темы и длительность; для спорта — упражнения, подходы, минуты.
+- 6–12 строк. Без Markdown-заголовков и без общих фраз («следите за питанием», «регулярно занимайтесь»).
 
 Цель: {title}
 Дедлайн: {target}
-Контекст пользователя (дополнительные детали из его сообщения): {context}
+Контекст пользователя: {context}
 Текущая дата: {now}, таймзона: {tz}. Планируй дни, которые ещё впереди на этой неделе."""
+
+# Для GigaChat: план обычным текстом (строгий JSON у GigaChat нестабилен)
+GIGA_PLAN_TEXT_PROMPT = PLAN_RULES + "\n\nВерни ТОЛЬКО сам текст плана, без JSON и без пояснений."
+
+GIGA_SUBTASKS_PROMPT = """Выбери из недельного плана 2-5 напоминаний. НЕ копируй строки плана — \
+придумай короткое действие-напоминание: например «Приготовить ужин по плану», \
+«Закупиться продуктами на неделю», «Взвеситься и записать вес», «Урок по плану: 40 минут».
+Верни ТОЛЬКО валидный JSON без текста вокруг: {{"subtasks": [{{"weekday": 0, "time": "19:00", "title": "..."}}]}}, \
+где weekday: 0=Пн..6=Вс, time "ЧЧ:ММ" (8:00-21:00). НЕ БОЛЬШЕ ОДНОЙ подзадачи на день.
+План:
+{plan}
+Сегодня: {now}, таймзона: {tz}. Бери только дни, которые ещё впереди на этой неделе."""
+
+# Для Gemini: тот же план, но сразу со схемой JSON
+GOAL_PLAN_PROMPT = PLAN_RULES + """
+Верни JSON: {{"plan": "текст плана", "subtasks": [{{"weekday": 0, "time": "19:00", "title": "короткое конкретное действие"}}]}}."""
 
 
 async def generate_goal_plan(
     title: str, context: str, target_date: date | None, user_tz: str
 ) -> "GoalPlan":
-    from pydantic import BaseModel as _BM
-
-    class SubtaskPlan(_BM):
-        title: str
-        weekday: int
-        time: str = "18:00"
-
-    class GoalPlanModel(_BM):
-        plan: str
-        subtasks: list[SubtaskPlan] = []
-
-    target = target_date.strftime("%d.%m.%Y") if target_date else "не указан"
-    user_msg = GOAL_PLAN_PROMPT.format(
+    fmt = dict(
         title=title,
-        target=target,
+        target=target_date.strftime("%d.%m.%Y") if target_date else "не указан",
         context=context or "нет",
         now=_now_str(user_tz),
         tz=user_tz,
     )
     if giga.enabled():
         try:
-            data = await giga.chat_json(user_msg, "Составь план недели по схеме.")
-            parsed = GoalPlanModel.model_validate(data)
-            return _sanitize_plan(parsed, user_tz)
+            plan_text = (
+                await giga.chat(
+                    [
+                        {"role": "system", "content": GIGA_PLAN_TEXT_PROMPT.format(**fmt)},
+                        {"role": "user", "content": "Составь план недели."},
+                    ],
+                    max_tokens=1500,
+                )
+            ).strip()
+            if plan_text:
+                sub_data = await giga.chat_json(
+                    GIGA_SUBTASKS_PROMPT.format(
+                        plan=plan_text[:3000], now=fmt["now"], tz=user_tz
+                    ),
+                    "Извлеки подзадачи из плана.",
+                    max_tokens=700,
+                )
+                parsed = GoalPlan(
+                    plan=plan_text,
+                    subtasks=[SubtaskPlan.model_validate(s) for s in sub_data.get("subtasks", [])],
+                )
+                return _sanitize_plan(parsed, user_tz)
         except Exception:
             log.warning("GigaChat goal plan failed, fallback to Gemini", exc_info=True)
+    user_msg = GOAL_PLAN_PROMPT.format(**fmt)
     last_exc: Exception | None = None
     for model in MODEL_CHAIN:
         try:
@@ -105,12 +145,12 @@ async def generate_goal_plan(
                 contents=user_msg,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=GoalPlanModel,
+                    response_schema=GoalPlan,
                     temperature=0.4,
                 ),
             )
             return _sanitize_plan(
-                GoalPlanModel.model_validate(json.loads(resp.text or "{}")), user_tz
+                GoalPlan.model_validate(json.loads(resp.text or "{}")), user_tz
             )
         except Exception as e:  # noqa: BLE001
             last_exc = e
@@ -122,19 +162,8 @@ async def generate_goal_plan(
     raise last_exc
 
 
-def _sanitize_plan(parsed, user_tz: str):
+def _sanitize_plan(parsed: "GoalPlan", user_tz: str) -> "GoalPlan":
     """Нормализует подзадачи: валидные weekday/time, только будущие дни недели."""
-    from pydantic import BaseModel as _BM
-
-    class SubtaskPlan(_BM):
-        title: str
-        weekday: int
-        time: str = "18:00"
-
-    class GoalPlan(_BM):
-        plan: str
-        subtasks: list[SubtaskPlan] = []
-
     tz = get_tz(user_tz)
     now = datetime.now(tz)
     out = []
@@ -161,6 +190,9 @@ def _sanitize_plan(parsed, user_tz: str):
             continue
         if s.title and s.title.strip():
             out.append(SubtaskPlan(title=s.title.strip()[:200], weekday=wd, time=t))
+    # Не больше одной подзадачи на день
+    seen: set[int] = set()
+    out = [s for s in out if s.weekday not in seen and not seen.add(s.weekday)]
     return GoalPlan(plan=parsed.plan or "", subtasks=out)
 
 

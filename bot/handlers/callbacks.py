@@ -108,6 +108,11 @@ async def on_object_action(cb: CallbackQuery) -> None:
                 await session.execute(
                     ReminderLog.__table__.delete().where(ReminderLog.event_id == obj_id)
                 )
+            elif kind == "gl":
+                # Сначала подзадачи — иначе FK не даст удалить цель
+                await session.execute(
+                    Subtask.__table__.delete().where(Subtask.goal_id == obj_id)
+                )
             await session.delete(obj)
             text = "Удалено 🗑"
         await session.commit()

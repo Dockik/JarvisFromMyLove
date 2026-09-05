@@ -142,13 +142,26 @@ async def transcribe(audio: bytes, filename: str = "voice.wav") -> str:
     raise last_exc
 
 
-async def chat_json(system_prompt: str, user_text: str) -> dict:
-    """Запрос, ожидающий JSON в ответе."""
-    raw = await chat(
-        [
-            {"role": "system", "content": system_prompt + "\nВерни ТОЛЬКО валидный JSON без пояснений."},
-            {"role": "user", "content": user_text},
-        ],
-        temperature=0.2,
-    )
-    return json.loads(_strip_json(raw))
+async def chat_json(system_prompt: str, user_text: str, max_tokens: int = 900) -> dict:
+    """Запрос, ожидающий JSON в ответе. При невалидном JSON — один повтор с указанием на ошибку."""
+    last_raw = ""
+    for attempt in range(2):
+        sys = system_prompt + "\nВерни ТОЛЬКО валидный JSON без пояснений."
+        if attempt:
+            sys += (
+                "\nОШИБКА: твой прошлый ответ — не валидный JSON (фрагмент: "
+                f"{last_raw[:150]!r}). Верни ответ ЗАНОВО — строго один JSON-объект, без текста вокруг."
+            )
+        raw = await chat(
+            [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user_text},
+            ],
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+        try:
+            return json.loads(_strip_json(raw))
+        except json.JSONDecodeError:
+            last_raw = raw
+    raise ValueError(f"GigaChat returned non-JSON twice: {last_raw[:200]!r}")
