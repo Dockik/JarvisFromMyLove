@@ -17,37 +17,62 @@ client = genai.Client(
     api_key=settings.gemini_api_key,
     http_options=types.HttpOptions(timeout=30_000),
 )
-MODEL = "gemini-3.6-flash"
 
 
 class ParsedIntent(BaseModel):
-    intent: Literal[
-        "add_event", "add_task", "add_goal", "query", "delete", "unknown"
-    ]
+    """Одно действие из сообщения."""
+
+    intent: Literal["add_event", "add_task", "add_goal", "query", "delete", "chat"]
     title: Optional[str] = None
     starts_at: Optional[str] = None  # ISO 8601 с offset
     due_at: Optional[str] = None
     target_date: Optional[str] = None  # YYYY-MM-DD
-    duration_minutes: Optional[int] = None
     remind_before_minutes: Optional[int] = None
     priority: Optional[Literal["low", "normal", "high"]] = None
-    answer: Optional[str] = None  # короткий ответ на query/unknown
+    answer: Optional[str] = None  # комментарий к записи / краткий ответ на query
 
-SYSTEM_PROMPT = """Ты — парсер намерений личного ассистента. Пользователь пишет по-русски \
-текстом или голосом. Твоя задача — вернуть ТОЛЬКО JSON по схеме.
 
-Правила:
-- intent=add_event: встреча/звонок/поездка/мероприятие с конкретным временем. Заполни title и starts_at (ISO 8601 с offset таймзоны пользователя). Если время не указано — intent=unknown.
-- intent=add_task: дело/задача без привязки к точному времени или с дедлайном. Заполни title, при необходимости due_at (ISO 8601), priority.
-- intent=add_goal: долгосрочная цель. title, при необходимости target_date (YYYY-MM-DD).
-- intent=query: вопрос про расписание/задачи/цели. Кратко ответь в поле answer на русском.
-- intent=delete: удалить/отменить/выполнить что-то существующее. title — что именно удалить/выполнить. Если "выполнить/сделал(а)" — это тоже delete (пометка как выполненное).
-- intent=unknown: приветствия, болтовня, запросы не про планирование. Кратко ответь в answer.
+class ParsedMessage(BaseModel):
+    """Разбор всего сообщения: может содержать несколько действий сразу."""
 
-Текущие дата и время: {now}. Таймзона пользователя: {tz}.
-Относительные даты ("завтра", "в пятницу", "через час") вычисляй от текущего времени.
-Если напоминание явно не указано, remind_before_minutes=60 для событий.
-Поле answer заполняй всегда — короткая фраза-подтверждение, что распознано."""
+    transcript: Optional[str] = None  # расшифровка сообщения (важно для голосовых)
+    items: list[ParsedIntent] = []
+    answer: Optional[str] = None
+
+
+SYSTEM_PROMPT = """Ты — мозг личного ассистента «Джарвис» в Telegram. Пользователь пишет по-русски \
+текстом или голосом. Верни ТОЛЬКО JSON по схеме:
+- transcript: что сказал пользователь своими словами (для текста — сам текст).
+- items: список действий, 0 / 1 или несколько, если в сообщении несколько просьб.
+- answer: короткая реплика-подтверждение для пользователя.
+
+Действия (поле intent каждого item):
+- intent=add_event: напоминание или событие с КОНКРЕТНЫМ временем («через час», «завтра в 15:00», \
+«в пятницу вечером», позвонить, встретиться). title, starts_at (ISO 8601 с offset таймзоны). \
+remind_before_minutes: 60 по умолчанию; если сказано «напомни за X минут» — X.
+- intent=add_task: дело без точного времени (купить, отправить, прочитать). title, при дедлайне due_at (ISO 8601), priority.
+- intent=add_goal: ДОЛГОСРОЧНАЯ цель — недели и месяцы («выучить испанский к лету», «накопить к Новому году»). \
+title, target_date (YYYY-MM-DD).
+- intent=query: вопрос про СВОЁ расписание/задачи/цели («что у меня завтра?»). Кратко ответь в answer.
+- intent=delete: удалить/отменить/выполнить что-то существующее. title — что именно. \
+«я сделал(а) X» — это тоже delete (пометка выполненным).
+- intent=chat: любой запрос не про планирование — погода, курс валют, новости, общий вопрос, болтовня, \
+благодарность. В answer ничего не пиши — ассистент ответит отдельным шагом с поиском в интернете.
+
+Важно:
+- Одно сообщение может нести несколько просьб: «напомни через час позвонить маме, и запиши, \
+что хочу выучить испанский к лету» → два items: add_event (позвонить маме) и add_goal (испанский).
+- «напомнить через 1 час 5 минут написать любимой» → add_event, starts_at = текущее время + 1 ч 5 мин.
+- Событие/напоминание — всегда конкретный момент времени; цель — растянутый срок (к лету, за месяц).
+- Относительные даты вычисляй от текущего времени: {now}. Таймзона пользователя: {tz}.
+- Если ничего распознать не удалось — верни один item с intent=chat и пустым остальным."""
+
+CHAT_SYSTEM_PROMPT = """Ты — Джарвис, личный ассистент пользователя в Telegram. Отвечай по-русски: \
+дружелюбно, по делу и кратко (1–5 предложений), без таблиц и заголовков. \
+Для погоды, курсов валют, новостей, расписаний и любых актуальных данных обязательно \
+используй поиск Google и опирайся на свежие результаты. Если спросили про погоду — \
+напиши условия и температуру по часам на запрошенный период, будет ли нужен зонт. \
+Текущие дата и время: {now}. Таймзона пользователя: {tz}."""
 
 
 def _system_prompt(user_tz: str) -> str:
@@ -55,13 +80,9 @@ def _system_prompt(user_tz: str) -> str:
     return SYSTEM_PROMPT.format(now=now, tz=user_tz)
 
 
-def _config(user_tz: str) -> types.GenerateContentConfig:
-    return types.GenerateContentConfig(
-        system_instruction=_system_prompt(user_tz),
-        response_mime_type="application/json",
-        response_schema=ParsedIntent,
-        temperature=0.2,
-    )
+def _chat_system_prompt(user_tz: str) -> str:
+    now = datetime.now(get_tz(user_tz)).isoformat(timespec="minutes")
+    return CHAT_SYSTEM_PROMPT.format(now=now, tz=user_tz)
 
 
 # Живые модели ключа (по списку API): 3.5-flash основная, дальше свежие 3.7/3.8
@@ -75,43 +96,80 @@ MODEL_CHAIN = [
 ]
 
 
-async def _generate(contents, user_tz: str) -> ParsedIntent:
+def _is_retryable(e: Exception) -> bool:
+    return getattr(e, "code", None) in (429, 500, 502, 503, 504)
+
+
+async def _generate(contents, user_tz: str) -> ParsedMessage:
     last_exc: Exception | None = None
     for model in MODEL_CHAIN:
         try:
             resp = await client.aio.models.generate_content(
                 model=model,
                 contents=contents,
-                config=_config(user_tz),
+                config=types.GenerateContentConfig(
+                    system_instruction=_system_prompt(user_tz),
+                    response_mime_type="application/json",
+                    response_schema=ParsedMessage,
+                    temperature=0.2,
+                ),
             )
             return _parse(resp)
         except Exception as e:  # noqa: BLE001
-            code = getattr(e, "code", None)
             last_exc = e
-            if code in (429, 500, 502, 503, 504):
-                log.warning("Gemini %s failed (%s), trying next model", model, code)
+            if _is_retryable(e):
+                log.warning("Gemini %s failed (%s), trying next model", model, getattr(e, "code", None))
                 continue
             raise
     assert last_exc is not None
     raise last_exc
 
 
-async def parse_text(text: str, user_tz: str) -> ParsedIntent:
+async def chat_answer(question: str, user_tz: str) -> str:
+    """Ответ на свободный вопрос с поиском Google (погода, курсы и т.п.)."""
+    last_exc: Exception | None = None
+    for model in MODEL_CHAIN:
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model,
+                contents=question,
+                config=types.GenerateContentConfig(
+                    system_instruction=_chat_system_prompt(user_tz),
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                    temperature=0.4,
+                ),
+            )
+            return (resp.text or "").strip() or "Не нашёл ответа, попробуйте уточнить вопрос 🙏"
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            if _is_retryable(e):
+                log.warning("Gemini chat %s failed (%s), trying next model", model, getattr(e, "code", None))
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
+async def parse_text(text: str, user_tz: str) -> ParsedMessage:
     return await _generate(text, user_tz)
 
 
-async def parse_voice(ogg_bytes: bytes, user_tz: str) -> ParsedIntent:
+async def parse_voice(ogg_bytes: bytes, user_tz: str) -> ParsedMessage:
     contents = types.Content(
         role="user",
         parts=[
             types.Part.from_bytes(data=ogg_bytes, mime_type="audio/ogg"),
-            types.Part(text="Расшифруй голосовое сообщение и разбери его как намерение."),
+            types.Part(text="Расшифруй голосовое сообщение и разбери его по схеме."),
         ],
     )
     return await _generate(contents, user_tz)
 
 
-def _parse(resp) -> ParsedIntent:
+def _parse(resp) -> ParsedMessage:
     raw = resp.text or "{}"
-    log.info("Gemini raw: %s", raw[:500])
-    return ParsedIntent.model_validate(json.loads(raw))
+    log.info("Gemini raw: %s", raw[:800])
+    parsed = ParsedMessage.model_validate(json.loads(raw))
+    # Защита от пустого разбора
+    if not parsed.items and not parsed.answer:
+        parsed.items = [ParsedIntent(intent="chat")]
+    return parsed
