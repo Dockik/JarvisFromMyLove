@@ -20,7 +20,7 @@ from ..gemini import (
 from ..keyboards import MAIN_MENU, confirm_card
 from ..pending import PendingGroup, chat_groups, pop_group, put_group
 from ..views import cancel_plans, find_for_delete, reschedule, save_intent, today_view
-from .. import webdata
+from .. import giga, webdata
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -89,7 +89,7 @@ def _preview_group(intents: list[ParsedIntent], tzname: str) -> str:
     return head + "\n\n" + "\n\n".join(cards) + "\n\nСохраняем всё?"
 
 
-async def _handle_message(message: Message, parsed: ParsedMessage, raw_text: str, tzname: str) -> None:
+async def _handle_message(message: Message, parsed: ParsedMessage, raw_text: str, tzname: str, hold_sent: bool = False) -> None:
     chat_id = message.chat.id
     adds = [i for i in parsed.items if i.intent in ("add_event", "add_task", "add_goal")]
     if adds:
@@ -111,7 +111,7 @@ async def _handle_message(message: Message, parsed: ParsedMessage, raw_text: str
             await _handle_query(message, item, raw_text)
             return
 
-    await _answer_chat(message, parsed, raw_text, tzname)
+    await _answer_chat(message, parsed, raw_text, tzname, hold_sent)
 
 
 async def _handle_cancel_plans(message: Message, item: ParsedIntent) -> None:
@@ -159,7 +159,20 @@ async def _handle_query(message: Message, item: ParsedIntent, raw_text: str) -> 
         await message.answer(item.answer or "Не совсем понял вопрос, уточните?", reply_markup=MAIN_MENU)
 
 
-async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, tzname: str) -> None:
+async def _race_hold(hold: asyncio.Task, main: asyncio.Task, message: Message) -> bool:
+    """Шлёт фразу-ожидание, только если основной ответ ещё не готов. Максимум ОДНА фраза на сообщение."""
+    await message.bot.send_chat_action(message.chat.id, "typing")
+    await asyncio.wait([hold, main], return_when=asyncio.FIRST_COMPLETED)
+    if not main.done() and hold.done() and hold.exception() is None and hold.result():
+        await message.answer(hold.result())
+        await message.bot.send_chat_action(message.chat.id, "typing")
+        return True
+    if main.done() and not hold.done():
+        hold.cancel()
+    return False
+
+
+async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, tzname: str, hold_sent: bool = False) -> None:
     chat_item = next((i for i in parsed.items if i.intent == "chat"), None)
 
     # Погода и курсы — через бесплатные API, без расхода квоты Gemini
@@ -183,13 +196,29 @@ async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, t
         return
 
     question = raw_text or parsed.transcript or parsed.answer or ""
+
+    async def _answer():
+        return await chat_answer(question, tzname)
+
+    answer_task = asyncio.create_task(_answer())
+    if hold_sent:
+        try:
+            text = await answer_task
+        except Exception as e:
+            log.exception("Gemini chat failed")
+            if getattr(e, "code", None) == 429:
+                text = (
+                    "Дневной лимит поисковых ответов на сегодня исчерпан 😔 "
+                    "Погоду и курсы валют я всё равно подскажу — просто спросите. "
+                    "Планирование работает как обычно."
+                )
+            else:
+                text = parsed.answer or "Не получилось найти ответ, попробуйте ещё раз 🙏"
+        await message.answer(text, reply_markup=MAIN_MENU)
+        return
+
     hold = asyncio.create_task(hold_phrase())
-    answer_task = asyncio.create_task(chat_answer(question, tzname))
-    await message.bot.send_chat_action(message.chat.id, "typing")
-    await asyncio.wait([hold, answer_task], return_when=asyncio.FIRST_COMPLETED)
-    if not answer_task.done() and hold.done() and hold.exception() is None and hold.result():
-        await message.answer(hold.result())
-        await message.bot.send_chat_action(message.chat.id, "typing")
+    await _race_hold(hold, answer_task, message)
     try:
         text = await answer_task
     except Exception as e:
@@ -244,18 +273,14 @@ async def on_text(message: Message) -> None:
 
     hold = asyncio.create_task(hold_phrase())
     parse_task = asyncio.create_task(parse_text(text, user.tz))
-    await message.bot.send_chat_action(message.chat.id, "typing")
-    await asyncio.wait([hold, parse_task], return_when=asyncio.FIRST_COMPLETED)
-    if not parse_task.done() and hold.done() and hold.exception() is None and hold.result():
-        await message.answer(hold.result())
-        await message.bot.send_chat_action(message.chat.id, "typing")
+    hold_sent = await _race_hold(hold, parse_task, message)
     try:
         parsed = await parse_task
     except Exception:
         log.exception("Gemini parse failed")
         await message.answer("Не получилось разобрать сообщение, попробуйте ещё раз 🙏")
         return
-    await _handle_message(message, parsed, text, user.tz)
+    await _handle_message(message, parsed, text, user.tz, hold_sent)
 
 
 @router.message(F.voice | F.audio_note)
@@ -267,17 +292,26 @@ async def on_voice(message: Message) -> None:
     buf = await message.bot.download_file(file.file_path)
     ogg_bytes = buf.read()
 
+    async def _voice_parsed():
+        # 1) GigaChat: транскрипция + разбор (если у ключа есть доступ к аудио)
+        if giga.enabled():
+            try:
+                wav = await asyncio.to_thread(giga.ogg_to_wav, ogg_bytes)
+                text = await giga.transcribe(wav)
+                if text:
+                    return await parse_text(text, user.tz), text
+            except Exception:
+                log.warning("GigaChat voice path failed, fallback to Gemini", exc_info=True)
+        # 2) Gemini: расшифровка + разбор одним запросом
+        return await parse_voice(ogg_bytes, user.tz), ""
+
     hold = asyncio.create_task(hold_phrase())
-    parse_task = asyncio.create_task(parse_voice(ogg_bytes, user.tz))
-    await message.bot.send_chat_action(message.chat.id, "typing")
-    await asyncio.wait([hold, parse_task], return_when=asyncio.FIRST_COMPLETED)
-    if not parse_task.done() and hold.done() and hold.exception() is None and hold.result():
-        await message.answer(hold.result())
-        await message.bot.send_chat_action(message.chat.id, "typing")
+    parse_task = asyncio.create_task(_voice_parsed())
+    hold_sent = await _race_hold(hold, parse_task, message)
     try:
-        parsed = await parse_task
+        parsed, transcript = await parse_task
     except Exception:
         log.exception("Gemini voice parse failed")
         await message.answer("Не получилось разобрать голосовое, попробуйте ещё раз 🙏")
         return
-    await _handle_message(message, parsed, parsed.transcript or "", user.tz)
+    await _handle_message(message, parsed, transcript or parsed.transcript or "", user.tz, hold_sent)

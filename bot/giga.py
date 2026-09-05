@@ -14,6 +14,7 @@ log = logging.getLogger(__name__)
 
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+TRANSCRIBE_URL = "https://gigachat.devices.sberbank.ru/api/v1/audio/transcriptions"
 
 _token: str | None = None
 _expires: float = 0.0
@@ -98,6 +99,47 @@ def _strip_json(text: str) -> str:
         if t.lower().startswith("json"):
             t = t[4:]
     return t.strip()
+
+
+def ogg_to_wav(ogg: bytes) -> bytes:
+    """OGG/Opus из Telegram → WAV 16 kHz mono (формат распознавания GigaChat). PyAV несёт FFmpeg внутри."""
+    import io
+
+    import av
+
+    inp = av.open(io.BytesIO(ogg))
+    out_buf = io.BytesIO()
+    out = av.open(out_buf, "w", format="wav")
+    stream = out.add_stream("pcm_s16le", rate=16000, layout="mono")
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+    for frame in inp.decode(audio=0):
+        for rf in resampler.resample(frame):
+            for packet in stream.encode(rf):
+                out.mux(packet)
+    out.close()
+    return out_buf.getvalue()
+
+
+async def transcribe(audio: bytes, filename: str = "voice.wav") -> str:
+    """Распознавание речи GigaChat. Возвращает текст или пустую строку."""
+    token = await get_token()
+    last_exc: Exception | None = None
+    for model in ("GigaChat-Audio", "whisper"):
+        try:
+            async with httpx.AsyncClient(timeout=120, verify=False) as c:
+                r = await c.post(
+                    TRANSCRIBE_URL,
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                    files={"file": (filename, audio, "audio/wav")},
+                    data={"model": model},
+                )
+                r.raise_for_status()
+                return (r.json().get("text") or "").strip()
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            log.warning("GigaChat transcribe with model %s failed: %s", model, e)
+    assert last_exc is not None
+    raise last_exc
 
 
 async def chat_json(system_prompt: str, user_text: str) -> dict:
