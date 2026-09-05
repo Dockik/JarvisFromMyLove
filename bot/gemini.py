@@ -64,9 +64,15 @@ def _config(user_tz: str) -> types.GenerateContentConfig:
     )
 
 
-# Порядок: стабильная 3.5 первой, перегруженная 3.6 и легаси 2.5 — запасные.
-# При 429/5xx (перегрузка, квота, дедлайн) пробуем следующую модель.
-MODEL_CHAIN = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash"]
+# Живые модели ключа (по списку API): 3.5-flash основная, дальше свежие 3.7/3.8
+# и облегчённая 3.5-lite. 2.5-flash для новых ключей закрыт (404), 3.6 сегодня
+# стабильно перегружен. При 429/5xx пробуем следующую модель.
+MODEL_CHAIN = [
+    "gemini-3.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+]
 
 
 async def _generate(contents, user_tz: str) -> ParsedIntent:
