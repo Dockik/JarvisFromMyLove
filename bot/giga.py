@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -57,25 +58,37 @@ async def get_token() -> str:
 
 
 async def chat(messages: list[dict], temperature: float = 0.4, max_tokens: int = 900) -> str:
-    """Один запрос к GigaChat. messages: [{"role": ..., "content": ...}]."""
+    """Один запрос к GigaChat с повторами при 429 (лимит RPM у Сбера). messages: [{"role": ..., "content": ...}]."""
     token = await get_token()
-    async with httpx.AsyncClient(timeout=90, verify=False) as c:
-        r = await c.post(
-            CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            json={
-                "model": "GigaChat",
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-        )
-        r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(2 * attempt)
+        try:
+            async with httpx.AsyncClient(timeout=90, verify=False) as c:
+                r = await c.post(
+                    CHAT_URL,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    json={
+                        "model": "GigaChat",
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    },
+                )
+                if r.status_code == 429:
+                    raise RuntimeError("giga 429")
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"]
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            log.warning("GigaChat chat attempt %s failed: %s", attempt + 1, e)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _strip_json(text: str) -> str:

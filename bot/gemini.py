@@ -176,34 +176,23 @@ async def _generate(contents, user_tz: str) -> ParsedMessage:
     raise last_exc
 
 
-async def chat_answer(question: str, user_tz: str) -> str:
-    """Свободное общение: GigaChat как живой ассистент, при сбое — Gemini с поиском."""
-    if giga.enabled():
-        try:
-            answer = await giga.chat(
-                [
-                    {"role": "system", "content": _chat_system_prompt(user_tz, internet=False)},
-                    {"role": "user", "content": question},
-                ]
-            )
-            if answer and answer.strip():
-                return answer.strip()
-        except Exception:
-            log.warning("GigaChat chat failed, fallback to Gemini search", exc_info=True)
+async def _gemini_chain(question: str, user_tz: str, use_search: bool) -> str:
     last_exc: Exception | None = None
     for round_no in range(MAX_ROUNDS):
         if round_no:
             await asyncio.sleep(RETRY_PAUSE_SEC)
         for model in MODEL_CHAIN:
             try:
+                config = types.GenerateContentConfig(
+                    system_instruction=_chat_system_prompt(user_tz, internet=use_search),
+                    temperature=0.4,
+                )
+                if use_search:
+                    config.tools = [types.Tool(google_search=types.GoogleSearch())]
                 resp = await client.aio.models.generate_content(
                     model=model,
                     contents=question,
-                    config=types.GenerateContentConfig(
-                        system_instruction=_chat_system_prompt(user_tz),
-                        tools=[types.Tool(google_search=types.GoogleSearch())],
-                        temperature=0.4,
-                    ),
+                    config=config,
                 )
                 return (resp.text or "").strip() or "Не нашёл ответа, попробуйте уточнить вопрос 🙏"
             except Exception as e:  # noqa: BLE001
@@ -217,6 +206,30 @@ async def chat_answer(question: str, user_tz: str) -> str:
                 raise
     assert last_exc is not None
     raise last_exc
+
+
+async def chat_answer(question: str, user_tz: str) -> str:
+    """Свободное общение: GigaChat как живой ассистент, при сбое — Gemini (поиск → без поиска)."""
+    if giga.enabled():
+        try:
+            answer = await giga.chat(
+                [
+                    {"role": "system", "content": _chat_system_prompt(user_tz, internet=False)},
+                    {"role": "user", "content": question},
+                ]
+            )
+            if answer and answer.strip():
+                return answer.strip()
+        except Exception:
+            log.warning("GigaChat chat failed, fallback to Gemini search", exc_info=True)
+    try:
+        return await _gemini_chain(question, user_tz, use_search=True)
+    except Exception as e:
+        if getattr(e, "code", None) != 429:
+            raise
+        # Квота поиска исчерпана — пробуем обычную генерацию (у неё отдельная квота)
+        log.warning("Gemini search quota exhausted, retrying without search")
+        return await _gemini_chain(question, user_tz, use_search=False)
 
 
 async def hold_phrase() -> str | None:
