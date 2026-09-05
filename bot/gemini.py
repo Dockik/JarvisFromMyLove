@@ -64,13 +64,34 @@ def _config(user_tz: str) -> types.GenerateContentConfig:
     )
 
 
+# Основная модель + запасные: при перегрузке (503) или квоте (429)
+# пробуем следующую, чтобы ответ пользователю не срывался
+MODEL_CHAIN = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
+
+
+async def _generate(contents, user_tz: str) -> ParsedIntent:
+    last_exc: Exception | None = None
+    for model in MODEL_CHAIN:
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=_config(user_tz),
+            )
+            return _parse(resp)
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "code", None)
+            last_exc = e
+            if code in (429, 500, 503):
+                log.warning("Gemini %s failed (%s), trying next model", model, code)
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
 async def parse_text(text: str, user_tz: str) -> ParsedIntent:
-    resp = await client.aio.models.generate_content(
-        model=MODEL,
-        contents=text,
-        config=_config(user_tz),
-    )
-    return _parse(resp)
+    return await _generate(text, user_tz)
 
 
 async def parse_voice(ogg_bytes: bytes, user_tz: str) -> ParsedIntent:
@@ -81,12 +102,7 @@ async def parse_voice(ogg_bytes: bytes, user_tz: str) -> ParsedIntent:
             types.Part(text="Расшифруй голосовое сообщение и разбери его как намерение."),
         ],
     )
-    resp = await client.aio.models.generate_content(
-        model=MODEL,
-        contents=contents,
-        config=_config(user_tz),
-    )
-    return _parse(resp)
+    return await _generate(contents, user_tz)
 
 
 def _parse(resp) -> ParsedIntent:

@@ -1,4 +1,6 @@
 .env
+start_bot_local.cmd
+bot_run.log
 __pycache__/
 *.pyc
 .venv/
