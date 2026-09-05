@@ -52,29 +52,36 @@ async def _geocode(city: str) -> tuple[str, float, float, int] | None:
     return r.get("name", city), r["latitude"], r["longitude"], r.get("utc_offset_seconds", 0)
 
 
-async def get_weather(city: str, hours: int = 3) -> str:
+def _header(name: str, hours: int, start_dt: datetime, start_hours: int) -> str:
+    if start_hours >= 1:
+        return f"🌤 <b>{name}</b>, с {start_dt.strftime('%H:%M (%d.%m)')} на {hours} ч:"
+    return f"🌤 <b>{name}</b>, ближайшие {hours} ч:"
+
+
+async def get_weather(city: str, hours: int = 3, start_hours: int = 0) -> str:
     """Погода: Open-Meteo → met.no → wttr.in (все бесплатные, без ключей)."""
     try:
         hours = max(1, min(int(hours or 3), 24))
+        start_hours = max(0, min(int(start_hours or 0), 47))
         geo = await _geocode(city)
         if geo is None:
             return f"Не нашёл город «{city}» 🤷 Попробуйте уточнить название."
         name, lat, lon, utc_off = geo
         try:
-            return await _weather_open_meteo(name, lat, lon, utc_off, hours)
+            return await _weather_open_meteo(name, lat, lon, utc_off, hours, start_hours)
         except Exception:
             log.warning("Open-Meteo failed, trying met.no", exc_info=True)
         try:
-            return await _weather_metno(name, lat, lon, utc_off, hours)
+            return await _weather_metno(name, lat, lon, utc_off, hours, start_hours)
         except Exception:
             log.warning("met.no failed, trying wttr.in", exc_info=True)
-        return await _weather_wttr(name, hours)
+        return await _weather_wttr(name, hours, start_hours)
     except Exception:
         log.exception("All weather sources failed")
         return "Не смог получить погоду, попробуйте ещё раз 🙏"
 
 
-async def _weather_open_meteo(name: str, lat: float, lon: float, utc_off: int, hours: int) -> str:
+async def _weather_open_meteo(name: str, lat: float, lon: float, utc_off: int, hours: int, start_hours: int) -> str:
     async with httpx.AsyncClient(timeout=10) as c:
         fc = await c.get(
             "https://api.open-meteo.com/v1/forecast",
@@ -96,13 +103,14 @@ async def _weather_open_meteo(name: str, lat: float, lon: float, utc_off: int, h
     codes = hourly.get("weather_code") or []
 
     now_local = (datetime.now(timezone.utc) + timedelta(seconds=utc_off)).replace(tzinfo=None)
-    deadline = now_local + timedelta(hours=hours)
+    start_dt = now_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=start_hours)
+    deadline = start_dt + timedelta(hours=hours)
 
-    lines = [f"🌤 <b>{name}</b>, ближайшие {hours} ч:"]
+    lines = [_header(name, hours, start_dt, start_hours)]
     umbrella = False
     for i, t in enumerate(times):
         dt = datetime.fromisoformat(t)
-        if dt < now_local.replace(minute=0, second=0, microsecond=0):
+        if dt < start_dt:
             continue
         if dt > deadline or len(lines) > MAX_ROWS:
             break
@@ -141,7 +149,7 @@ def _symbol_ru(code: str) -> str:
     return ""
 
 
-async def _weather_metno(name: str, lat: float, lon: float, utc_off: int, hours: int) -> str:
+async def _weather_metno(name: str, lat: float, lon: float, utc_off: int, hours: int, start_hours: int) -> str:
     headers = {"User-Agent": "JarvisTelegramAssistant/1.0 (github.com/Dockik)"}
     async with httpx.AsyncClient(timeout=15, headers=headers) as c:
         resp = await c.get(
@@ -152,14 +160,15 @@ async def _weather_metno(name: str, lat: float, lon: float, utc_off: int, hours:
     data = resp.json()
 
     now_local = (datetime.now(timezone.utc) + timedelta(seconds=utc_off)).replace(tzinfo=None)
-    deadline = now_local + timedelta(hours=hours)
+    start_dt = now_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=start_hours)
+    deadline = start_dt + timedelta(hours=hours)
 
-    lines = [f"🌤 <b>{name}</b>, ближайшие {hours} ч:"]
+    lines = [_header(name, hours, start_dt, start_hours)]
     umbrella = False
     for entry in data["properties"]["timeseries"]:
         dt = datetime.fromisoformat(entry["time"].replace("Z", "+00:00"))
         dt = (dt + timedelta(seconds=utc_off)).replace(tzinfo=None)
-        if dt < now_local.replace(minute=0, second=0, microsecond=0):
+        if dt < start_dt:
             continue
         if dt > deadline or len(lines) > MAX_ROWS:
             break
@@ -195,8 +204,7 @@ def _desc_ru(desc: str) -> str:
     return desc
 
 
-async def _weather_wttr(city: str, hours: int) -> str:
-    hours = max(1, min(int(hours or 3), 24))
+async def _weather_wttr(city: str, hours: int, start_hours: int = 0) -> str:
     async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "curl/8.0"}) as c:
         resp = await c.get(f"https://wttr.in/{city}", params={"format": "j1"})
         resp.raise_for_status()
@@ -213,16 +221,17 @@ async def _weather_wttr(city: str, hours: int) -> str:
         local_now = datetime.strptime(obs, "%Y-%m-%d %I:%M %p")
     except (ValueError, TypeError):
         local_now = datetime.utcnow()
-    deadline = local_now + timedelta(hours=hours)
+    start_dt = local_now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=start_hours)
+    deadline = start_dt + timedelta(hours=hours)
 
-    lines = [f"🌤 <b>{name}</b>, ближайшие {hours} ч:"]
+    lines = [_header(name, hours, start_dt, start_hours)]
     umbrella = False
     for day in data.get("weather", []):
         day_date = datetime.strptime(day["date"], "%Y-%m-%d")
         for slot in day.get("hourly", []):
             hhmm_raw = slot.get("time", "0").zfill(4)
             dt = day_date.replace(hour=int(hhmm_raw[:2]), minute=int(hhmm_raw[2:]))
-            if dt < local_now.replace(minute=0, second=0, microsecond=0):
+            if dt < start_dt:
                 continue
             if dt > deadline or len(lines) > MAX_ROWS:
                 return _finish(lines, umbrella)

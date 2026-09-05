@@ -5,7 +5,7 @@ import logging
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
-from ..db import Event, Goal, ReminderLog, SessionLocal, User, get_or_create_user
+from ..db import Event, Goal, ReminderLog, SessionLocal, Task, User, get_or_create_user
 from ..keyboards import MAIN_MENU, TIMEZONES, settings_menu
 from ..pending import pop_group
 from ..views import goals_view, save_intent, tasks_view, today_view

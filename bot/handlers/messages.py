@@ -139,7 +139,11 @@ async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, t
     # Погода и курсы — через бесплатные API, без расхода квоты Gemini
     try:
         if chat_item and chat_item.weather_city:
-            text = await webdata.get_weather(chat_item.weather_city, chat_item.weather_hours or 3)
+            text = await webdata.get_weather(
+                chat_item.weather_city,
+                chat_item.weather_hours or 3,
+                chat_item.weather_start_hours or 0,
+            )
             await message.answer(text, reply_markup=MAIN_MENU)
             return
         if chat_item and chat_item.currency:
