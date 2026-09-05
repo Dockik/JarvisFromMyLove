@@ -6,7 +6,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_tz
-from .db import Event, Goal, Task, User
+from .db import Event, Goal, ReminderLog, Task, User
 
 WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
@@ -99,7 +99,7 @@ async def tasks_view(session: AsyncSession, user: User) -> str:
         )
     )
     if not tasks:
-        return "Задач нет. Напишите их мне текстом или голосом!"
+        return "Задач нет. Напоминания с конкретным временем — это события, они живут в разделе «📅 Сегодня»."
     return "✅ <b>Активные задачи:</b>\n" + "\n".join(fmt_task(t, user.tz) for t in tasks)
 
 
@@ -201,3 +201,58 @@ async def find_for_delete(session: AsyncSession, user: User, title: str) -> list
     ):
         found.append(("gl", g.id, f"Цель: {g.title}"))
     return found
+
+
+async def cancel_plans(session: AsyncSession, user: User, scope: str = "today") -> str:
+    """Помечает выполненными/отменёнными события и задачи."""
+    tz = get_tz(user.tz)
+    now = datetime.now(tz)
+    start = end = None
+    if scope == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        end = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc)
+
+    q = select(Event).where(Event.user_id == user.id, Event.done.is_(False))
+    if start is not None:
+        q = q.where(Event.starts_at >= start, Event.starts_at < end)
+    events = list(await session.scalars(q))
+
+    qt = select(Task).where(Task.user_id == user.id, Task.done.is_(False))
+    tasks = list(await session.scalars(qt))
+
+    for e in events:
+        e.done = True
+    for t in tasks:
+        t.done = True
+    await session.commit()
+
+    period = "на сегодня" if scope == "today" else "вообще все"
+    parts = []
+    if events:
+        parts.append(f"событий: {len(events)}")
+    if tasks:
+        parts.append(f"задач: {len(tasks)}")
+    if not parts:
+        return f"Отменять нечего — активных дел {period} не нашлось 🙂"
+    return f"🧹 Отменил {period}: " + ", ".join(parts) + "."
+
+
+async def reschedule(session: AsyncSession, user: User, title: str, new_dt: datetime) -> str:
+    """Переносит событие на новое время."""
+    found = await find_for_delete(session, user, title)
+    ev_matches = [f for f in found if f[0] == "ev"]
+    if not ev_matches:
+        if found:
+            return "Переносить по времени я умею только события (с конкретным временем)."
+        return f"Не нашёл «{title}» для переноса. Попробуйте уточнить название."
+    kind, obj_id, label = ev_matches[0]
+    ev = await session.get(Event, obj_id)
+    if ev is None:
+        return f"Не нашёл «{title}» для переноса."
+    old = _fmt_dt(ev.starts_at, user.tz)
+    ev.starts_at = new_dt.astimezone(timezone.utc)
+    from sqlalchemy import delete as sa_delete
+
+    await session.execute(sa_delete(ReminderLog).where(ReminderLog.event_id == ev.id))
+    await session.commit()
+    return f"🔁 Перенёс: <b>{ev.title}</b>\nБыло: {old}\nСтало: {_fmt_dt(ev.starts_at, user.tz)}"

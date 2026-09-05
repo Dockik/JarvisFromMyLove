@@ -19,7 +19,7 @@ from ..gemini import (
 )
 from ..keyboards import MAIN_MENU, confirm_card
 from ..pending import PendingGroup, chat_groups, pop_group, put_group
-from ..views import find_for_delete, save_intent, today_view
+from ..views import cancel_plans, find_for_delete, reschedule, save_intent, today_view
 from .. import webdata
 
 log = logging.getLogger(__name__)
@@ -101,11 +101,37 @@ async def _handle_message(message: Message, parsed: ParsedMessage, raw_text: str
         if item.intent == "delete":
             await _handle_delete(message, item, raw_text)
             return
+        if item.intent == "cancel_plans":
+            await _handle_cancel_plans(message, item)
+            return
+        if item.intent == "reschedule":
+            await _handle_reschedule(message, item, raw_text, tzname)
+            return
         if item.intent == "query":
             await _handle_query(message, item, raw_text)
             return
 
     await _answer_chat(message, parsed, raw_text, tzname)
+
+
+async def _handle_cancel_plans(message: Message, item: ParsedIntent) -> None:
+    scope = item.scope or "today"
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
+        text = await cancel_plans(session, user, scope)
+    await message.answer(text, reply_markup=MAIN_MENU)
+
+
+async def _handle_reschedule(message: Message, item: ParsedIntent, raw_text: str, tzname: str) -> None:
+    new_dt = _parse_iso(item.starts_at, tzname)
+    if new_dt is None:
+        await message.answer("Не распознал, на какое время перенести. Напишите, например: «перенеси на завтра в 15:00».")
+        return
+    title = item.title or raw_text
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
+        text = await reschedule(session, user, title, new_dt)
+    await message.answer(text, reply_markup=MAIN_MENU)
 
 
 async def _handle_delete(message: Message, item: ParsedIntent, raw_text: str) -> None:

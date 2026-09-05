@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     bot_token: str
     gemini_api_key: str
     database_url: str
+    giga_key: str = ""  # base64-ключ GigaChat; пусто — GigaChat отключён
+    giga_scope: str = "GIGACHAT_API_PERS"
     base_url: str = ""
     webhook_secret: str = "change-me"
     default_tz: str = "Europe/Moscow"

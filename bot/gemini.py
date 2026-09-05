@@ -11,6 +11,7 @@ from google.genai import types
 from pydantic import BaseModel
 
 from .config import get_tz, settings
+from . import giga
 
 log = logging.getLogger(__name__)
 
@@ -23,14 +24,18 @@ client = genai.Client(
 class ParsedIntent(BaseModel):
     """Одно действие из сообщения."""
 
-    intent: Literal["add_event", "add_task", "add_goal", "query", "delete", "chat"]
+    intent: Literal[
+        "add_event", "add_task", "add_goal", "query", "delete", "chat",
+        "cancel_plans", "reschedule",
+    ]
     title: Optional[str] = None
-    starts_at: Optional[str] = None  # ISO 8601 с offset
+    starts_at: Optional[str] = None  # ISO 8601 с offset (для reschedule — НОВОЕ время)
     due_at: Optional[str] = None
     target_date: Optional[str] = None  # YYYY-MM-DD
     remind_before_minutes: Optional[int] = None
     priority: Optional[Literal["low", "normal", "high"]] = None
     answer: Optional[str] = None  # комментарий к записи / краткий ответ на query
+    scope: Optional[Literal["today", "all"]] = None  # для cancel_plans
     # Только для intent=chat — чтобы ответить без квоты поиска:
     weather_city: Optional[str] = None  # город вопроса про погоду
     weather_hours: Optional[int] = None  # длительность окна прогноза в часах
@@ -45,6 +50,8 @@ class ParsedMessage(BaseModel):
     transcript: Optional[str] = None  # расшифровка сообщения (важно для голосовых)
     items: list[ParsedIntent] = []
     answer: Optional[str] = None
+    # Контроль арифметики времени: какой «сейчас» использовала модель
+    now_assumed: Optional[str] = None
 
 
 SYSTEM_PROMPT = """Ты — мозг личного ассистента «Джарвис» в Telegram. Пользователь пишет по-русски \
@@ -52,6 +59,7 @@ SYSTEM_PROMPT = """Ты — мозг личного ассистента «Дж�
 - transcript: что сказал пользователь своими словами (для текста — сам текст).
 - items: список действий, 0 / 1 или несколько, если в сообщении несколько просьб.
 - answer: короткая реплика-подтверждение для пользователя.
+- now_assumed: текущий момент, ОТ КОТОРОГО ты считал даты — дословно из строки «Текущее время» ниже.
 
 Действия (поле intent каждого item):
 - intent=add_event: напоминание или событие с КОНКРЕТНЫМ временем («через час», «завтра в 15:00», \
@@ -63,6 +71,10 @@ title, target_date (YYYY-MM-DD).
 - intent=query: вопрос про СВОЁ расписание/задачи/цели («что у меня завтра?»). Кратко ответь в answer.
 - intent=delete: удалить/отменить/выполнить что-то существующее. title — что именно. \
 «я сделал(а) X» — это тоже delete (пометка выполненным).
+- intent=cancel_plans: массовая отмена — «отмени все мои планы на сегодня», «сотри всё расписание». \
+scope: today (по умолчанию) или all (если сказано «все вообще»).
+- intent=reschedule: перенести существующую вещь на другое время — «перенеси звонок маме на завтра в 15:00». \
+title — что перенести, starts_at — НОВОЕ время (ISO 8601).
 - intent=chat: любой запрос не про планирование — погода, курс валют, новости, общий вопрос, болтовня, \
 благодарность. В answer ничего не пиши — ассистент ответит отдельным шагом.
   * Если спросили про ПОГОДУ: заполни weather_city (если город не назван — «Москва»). \
@@ -79,15 +91,19 @@ weather_start_hours — через сколько часов от СЕЙЧАС �
 что хочу выучить испанский к лету» → два items: add_event (позвонить маме) и add_goal (испанский).
 - «напомнить через 1 час 5 минут написать любимой» → add_event, starts_at = текущее время + 1 ч 5 мин.
 - Событие/напоминание — всегда конкретный момент времени; цель — растянутый срок (к лету, за месяц).
-- Относительные даты вычисляй от текущего времени: {now}. Таймзона пользователя: {tz}.
+- Текущее время: {now}. Таймзона: {tz}. Все относительные сроки («через час», «завтра») считай \
+СТРОГО от этого момента. СЧИТАЙ ДАТЫ ВНИМАТЕЛЬНО: «завтра» — следующий календарный день после \
+указанного «Текущее время», «послезавтра» — через два. Перед ответом сверь день и месяц.
 - Если ничего распознать не удалось — верни один item с intent=chat и пустым остальным."""
 
 CHAT_SYSTEM_PROMPT = """Ты — Джарвис, личный ассистент пользователя в Telegram. Отвечай по-русски: \
 дружелюбно, по делу и кратко (1–5 предложений), без таблиц и заголовков. \
-Для погоды, курсов валют, новостей, расписаний и любых актуальных данных обязательно \
-используй поиск Google и опирайся на свежие результаты. Если спросили про погоду — \
-напиши условия и температуру по часам на запрошенный период, будет ли нужен зонт. \
+{internet_rule} \
+Если спросили про погоду — напиши условия и температуру по часам на запрошенный период, будет ли нужен зонт. \
 Текущие дата и время: {now}. Таймзона пользователя: {tz}."""
+
+INTERNET_ON = "Для погоды, курсов валют, новостей и любых актуальных данных обязательно используй поиск Google и опирайся на свежие результаты."
+INTERNET_OFF = "У тебя нет доступа в интернет: не выдумывай точные актуальные цифры (курсы, счёт матчей и т.п.) и честно говори, если не уверен."
 
 
 def _system_prompt(user_tz: str) -> str:
@@ -95,9 +111,10 @@ def _system_prompt(user_tz: str) -> str:
     return SYSTEM_PROMPT.format(now=now, tz=user_tz)
 
 
-def _chat_system_prompt(user_tz: str) -> str:
+def _chat_system_prompt(user_tz: str, internet: bool = True) -> str:
     now = datetime.now(get_tz(user_tz)).isoformat(timespec="minutes")
-    return CHAT_SYSTEM_PROMPT.format(now=now, tz=user_tz)
+    rule = INTERNET_ON if internet else INTERNET_OFF
+    return CHAT_SYSTEM_PROMPT.format(now=now, tz=user_tz, internet_rule=rule)
 
 
 # Живые модели ключа (по списку API): 3.5-flash основная, дальше свежие 3.7
@@ -160,7 +177,19 @@ async def _generate(contents, user_tz: str) -> ParsedMessage:
 
 
 async def chat_answer(question: str, user_tz: str) -> str:
-    """Ответ на свободный вопрос с поиском Google (погода, курсы и т.п.)."""
+    """Свободное общение: GigaChat как живой ассистент, при сбое — Gemini с поиском."""
+    if giga.enabled():
+        try:
+            answer = await giga.chat(
+                [
+                    {"role": "system", "content": _chat_system_prompt(user_tz, internet=False)},
+                    {"role": "user", "content": question},
+                ]
+            )
+            if answer and answer.strip():
+                return answer.strip()
+        except Exception:
+            log.warning("GigaChat chat failed, fallback to Gemini search", exc_info=True)
     last_exc: Exception | None = None
     for round_no in range(MAX_ROUNDS):
         if round_no:
@@ -192,10 +221,20 @@ async def chat_answer(question: str, user_tz: str) -> str:
 
 async def hold_phrase() -> str | None:
     """Живая фраза «уже работаю над этим» — генерируется отдельно, чтобы не быть шаблонной."""
+    prompt = HOLD_PROMPT.format(name=OWNER_NAME)
+    if giga.enabled():
+        try:
+            text = (await giga.chat(
+                [{"role": "user", "content": prompt}], temperature=1.1, max_tokens=60
+            )).strip().strip('"«»').strip()
+            if text:
+                return text
+        except Exception:
+            log.warning("hold_phrase via GigaChat failed", exc_info=True)
     try:
         resp = await client.aio.models.generate_content(
             model="gemini-3.5-flash-lite",
-            contents=HOLD_PROMPT.format(name=OWNER_NAME),
+            contents=prompt,
             config=types.GenerateContentConfig(temperature=1.0),
         )
         text = (resp.text or "").strip().strip('"«»').strip()
@@ -205,7 +244,83 @@ async def hold_phrase() -> str | None:
         return None
 
 
+def _valid_iso(s: str | None) -> bool:
+    if not s:
+        return False
+    try:
+        datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+
+def _now_str(user_tz: str) -> str:
+    return datetime.now(get_tz(user_tz)).isoformat(timespec="minutes")
+
+
+def _now_skew(parsed: ParsedMessage, user_tz: str) -> float:
+    """Насколько модель ошиблась с «сейчас» (в секундах)."""
+    if not parsed.now_assumed:
+        return 0.0
+    try:
+        assumed = datetime.fromisoformat(parsed.now_assumed.replace("Z", "+00:00"))
+        if assumed.tzinfo is None:
+            assumed = assumed.replace(tzinfo=get_tz(user_tz))
+        return abs((assumed - datetime.now(get_tz(user_tz))).total_seconds())
+    except ValueError:
+        return 0.0
+
+
 async def parse_text(text: str, user_tz: str) -> ParsedMessage:
+    # GigaChat — первичные мозги (без квот и лимитов Gemini), Gemini — запасной
+    if giga.enabled():
+        for attempt in range(2):
+            try:
+                data = await giga.chat_json(_system_prompt(user_tz), text)
+                parsed = ParsedMessage.model_validate(data)
+            except Exception:
+                log.warning("GigaChat parse attempt %s failed", attempt + 1, exc_info=True)
+                continue
+            # Проверяем, что все даты — валидный ISO; если нет, просим переделать
+            bad = [
+                (i, i.starts_at) for i in parsed.items
+                if i.intent == "add_event" and not _valid_iso(i.starts_at)
+            ] + [
+                (i, i.due_at) for i in parsed.items
+                if i.intent == "add_task" and i.due_at and not _valid_iso(i.due_at)
+            ]
+            # Проверяем арифметику времени: модель считала не от того «сейчас»
+            skew = _now_skew(parsed, user_tz)
+            if not bad and skew < 900:
+                return parsed
+            if attempt == 1:
+                break
+            problems = []
+            if bad:
+                problems.append(
+                    "поля с датами не в формате ISO 8601: "
+                    + "; ".join(f"«{v}»" for _, v in bad)
+                    + " (относительное время («через полтора часа») ВЫЧИСЛИ в абсолютную дату сам)"
+                )
+            if skew >= 900:
+                problems.append(f"ты считала не от того времени: сейчас на самом деле {_now_str(user_tz)}")
+            fix_note = (
+                "ОШИБКА в твоём прошлом ответе: " + "; ".join(problems)
+                + ". Верни JSON заново, все starts_at/due_at — валидный ISO 8601 datetime "
+                "с offset таймзоны, пересчитанный от точного текущего времени."
+            )
+            try:
+                data = await giga.chat_json(_system_prompt(user_tz) + "\n" + fix_note, text)
+                parsed = ParsedMessage.model_validate(data)
+            except Exception:
+                log.warning("GigaChat fix attempt failed", exc_info=True)
+                break
+            if not [
+                i for i in parsed.items
+                if i.intent == "add_event" and not _valid_iso(i.starts_at)
+            ] and _now_skew(parsed, user_tz) < 900:
+                return parsed
+            break
     return await _generate(text, user_tz)
 
 
