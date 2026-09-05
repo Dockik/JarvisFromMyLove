@@ -95,7 +95,7 @@ async def tasks_view(session: AsyncSession, user: User) -> str:
         await session.scalars(
             select(Task)
             .where(Task.user_id == user.id, Task.done.is_(False))
-            .order_by(Task.due_at.is_(True), Task.due_at)
+            .order_by(Task.due_at.is_(None), Task.due_at)
         )
     )
     if not tasks:
