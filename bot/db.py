@@ -153,10 +153,10 @@ async def get_or_create_user(
 ) -> User:
     user = await session.scalar(select(User).where(User.tg_id == tg_id))
     if user is None:
+        # display_name оставляем пустым: бот сам спросит имя при /start
         user = User(
             tg_id=tg_id,
             username=username,
-            display_name=(first_name or username or "")[:64] or None,
             tz=settings.default_tz,
         )
         session.add(user)
