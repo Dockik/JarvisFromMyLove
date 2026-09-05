@@ -31,6 +31,11 @@ class ParsedIntent(BaseModel):
     remind_before_minutes: Optional[int] = None
     priority: Optional[Literal["low", "normal", "high"]] = None
     answer: Optional[str] = None  # комментарий к записи / краткий ответ на query
+    # Только для intent=chat — чтобы ответить без квоты поиска:
+    weather_city: Optional[str] = None  # город вопроса про погоду
+    weather_hours: Optional[int] = None  # на сколько часов вперёд
+    currency: Optional[str] = None  # ISO-код валюты, курс которой спрашивают
+    currency_base: Optional[str] = None  # в чём считать, по умолчанию RUB
 
 
 class ParsedMessage(BaseModel):
@@ -58,7 +63,11 @@ title, target_date (YYYY-MM-DD).
 - intent=delete: удалить/отменить/выполнить что-то существующее. title — что именно. \
 «я сделал(а) X» — это тоже delete (пометка выполненным).
 - intent=chat: любой запрос не про планирование — погода, курс валют, новости, общий вопрос, болтовня, \
-благодарность. В answer ничего не пиши — ассистент ответит отдельным шагом с поиском в интернете.
+благодарность. В answer ничего не пиши — ассистент ответит отдельным шагом.
+  * Если спросили про ПОГОДУ: заполни weather_city (если город не назван — «Москва») и weather_hours \
+(на сколько часов, по умолчанию 3, максимум 24). Ответ придёт из метео-API.
+  * Если спросили про КУРС ВАЛЮТ: заполни currency (ISO-код, например USD, EUR) и currency_base \
+(в чём считать, по умолчанию RUB). Ответ придёт из API курсов.
 
 Важно:
 - Одно сообщение может нести несколько просьб: «напомни через час позвонить маме, и запиши, \
@@ -182,11 +191,7 @@ async def hold_phrase() -> str | None:
         resp = await client.aio.models.generate_content(
             model="gemini-3.5-flash-lite",
             contents=HOLD_PROMPT.format(name=OWNER_NAME),
-            config=types.GenerateContentConfig(
-                temperature=1.0,
-                max_output_tokens=60,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
+            config=types.GenerateContentConfig(temperature=1.0),
         )
         text = (resp.text or "").strip().strip('"«»').strip()
         return text or None

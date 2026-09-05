@@ -20,6 +20,7 @@ from ..gemini import (
 from ..keyboards import MAIN_MENU, confirm_card
 from ..pending import PendingGroup, chat_groups, pop_group, put_group
 from ..views import find_for_delete, save_intent, today_view
+from .. import webdata
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -133,6 +134,24 @@ async def _handle_query(message: Message, item: ParsedIntent, raw_text: str) -> 
 
 
 async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, tzname: str) -> None:
+    chat_item = next((i for i in parsed.items if i.intent == "chat"), None)
+
+    # Погода и курсы — через бесплатные API, без расхода квоты Gemini
+    try:
+        if chat_item and chat_item.weather_city:
+            text = await webdata.get_weather(chat_item.weather_city, chat_item.weather_hours or 3)
+            await message.answer(text, reply_markup=MAIN_MENU)
+            return
+        if chat_item and chat_item.currency:
+            text = await webdata.get_rate(chat_item.currency, chat_item.currency_base or "RUB")
+            await message.answer(text, reply_markup=MAIN_MENU)
+            return
+    except Exception:
+        log.exception("Weather/rate API failed")
+        text = "Не смог получить данные, попробуйте ещё раз 🙏"
+        await message.answer(text, reply_markup=MAIN_MENU)
+        return
+
     question = raw_text or parsed.transcript or parsed.answer or ""
     hold = asyncio.create_task(hold_phrase())
     answer_task = asyncio.create_task(chat_answer(question, tzname))
@@ -143,9 +162,16 @@ async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, t
         await message.bot.send_chat_action(message.chat.id, "typing")
     try:
         text = await answer_task
-    except Exception:
+    except Exception as e:
         log.exception("Gemini chat failed")
-        text = parsed.answer or "Не получилось найти ответ, попробуйте ещё раз 🙏"
+        if getattr(e, "code", None) == 429:
+            text = (
+                "Дневной лимит поисковых ответов на сегодня исчерпан 😔 "
+                "Погоду и курсы валют я всё равно подскажу — просто спросите. "
+                "Планирование работает как обычно."
+            )
+        else:
+            text = parsed.answer or "Не получилось найти ответ, попробуйте ещё раз 🙏"
     await message.answer(text, reply_markup=MAIN_MENU)
 
 
