@@ -36,6 +36,7 @@ class ParsedIntent(BaseModel):
     priority: Optional[Literal["low", "normal", "high"]] = None
     answer: Optional[str] = None  # комментарий к записи / краткий ответ на query
     scope: Optional[Literal["today", "all"]] = None  # для cancel_plans
+    target: Optional[Literal["events", "tasks", "goals", "all"]] = None  # что именно чистить
     # Только для intent=chat — чтобы ответить без квоты поиска:
     weather_city: Optional[str] = None  # город вопроса про погоду
     weather_hours: Optional[int] = None  # длительность окна прогноза в часах
@@ -180,8 +181,12 @@ title, target_date (YYYY-MM-DD).
 - intent=query: вопрос про СВОЁ расписание/задачи/цели («что у меня завтра?»). Кратко ответь в answer.
 - intent=delete: удалить/отменить/выполнить что-то существующее. title — что именно. \
 «я сделал(а) X» — это тоже delete (пометка выполненным).
-- intent=cancel_plans: массовая отмена — «отмени все мои планы на сегодня», «сотри всё расписание». \
-scope: today (по умолчанию) или all (если сказано «все вообще»).
+- intent=cancel_plans: МАССОВОЕ удаление/очистка/отмена — «очисти все мои цели, задачи и события», \
+«удали все мои цели», «сотри все задачи», «отмени все планы на сегодня». \
+scope: today — только если явно сказано «на сегодня»; иначе all. \
+target: что чистить — goals (цели), tasks (задачи), events (события) или all (всё сразу). \
+Примеры: «удали все мои цели» → target=goals, scope=all; «очисти всё» → target=all, scope=all; \
+«отмени планы на сегодня» → target=all, scope=today.
 - intent=reschedule: перенести существующую вещь на другое время — «перенеси звонок маме на завтра в 15:00». \
 title — что перенести, starts_at — НОВОЕ время (ISO 8601).
 - intent=chat: любой запрос не про планирование — погода, курс валют, новости, общий вопрос, болтовня, \

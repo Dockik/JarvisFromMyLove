@@ -26,6 +26,18 @@ def confirm_card(prefix: str, key: str | int) -> InlineKeyboardMarkup:
     )
 
 
+def view_footer() -> InlineKeyboardMarkup:
+    """Компактная клавиатура под ответом: посмотреть задачи / цели."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Задачи", callback_data="view:tasks"),
+                InlineKeyboardButton(text="🎯 Цели", callback_data="view:goals"),
+            ]
+        ]
+    )
+
+
 def event_actions(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

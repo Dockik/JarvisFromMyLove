@@ -209,8 +209,10 @@ async def find_for_delete(session: AsyncSession, user: User, title: str) -> list
     return found
 
 
-async def cancel_plans(session: AsyncSession, user: User, scope: str = "today") -> str:
-    """Помечает выполненными/отменёнными события и задачи."""
+async def cancel_plans(
+    session: AsyncSession, user: User, scope: str = "today", target: str = "all"
+) -> str:
+    """Массовая очистка: помечает выполненными события/задачи/цели (target: events|tasks|goals|all)."""
     tz = get_tz(user.tz)
     now = datetime.now(tz)
     start = end = None
@@ -218,29 +220,36 @@ async def cancel_plans(session: AsyncSession, user: User, scope: str = "today") 
         start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         end = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc)
 
-    q = select(Event).where(Event.user_id == user.id, Event.done.is_(False))
-    if start is not None:
-        q = q.where(Event.starts_at >= start, Event.starts_at < end)
-    events = list(await session.scalars(q))
-
-    qt = select(Task).where(Task.user_id == user.id, Task.done.is_(False))
-    tasks = list(await session.scalars(qt))
-
-    for e in events:
-        e.done = True
-    for t in tasks:
-        t.done = True
+    parts: list[str] = []
+    if target in ("events", "all"):
+        q = select(Event).where(Event.user_id == user.id, Event.done.is_(False))
+        if start is not None:
+            q = q.where(Event.starts_at >= start, Event.starts_at < end)
+        events = list(await session.scalars(q))
+        for e in events:
+            e.done = True
+        if events:
+            parts.append(f"событий: {len(events)}")
+    if target in ("tasks", "all"):
+        qt = select(Task).where(Task.user_id == user.id, Task.done.is_(False))
+        tasks = list(await session.scalars(qt))
+        for t in tasks:
+            t.done = True
+        if tasks:
+            parts.append(f"задач: {len(tasks)}")
+    if target in ("goals", "all"):
+        qg = select(Goal).where(Goal.user_id == user.id, Goal.done.is_(False))
+        goals = list(await session.scalars(qg))
+        for g in goals:
+            g.done = True
+        if goals:
+            parts.append(f"целей: {len(goals)}")
     await session.commit()
 
     period = "на сегодня" if scope == "today" else "вообще все"
-    parts = []
-    if events:
-        parts.append(f"событий: {len(events)}")
-    if tasks:
-        parts.append(f"задач: {len(tasks)}")
     if not parts:
-        return f"Отменять нечего — активных дел {period} не нашлось 🙂"
-    return f"🧹 Отменил {period}: " + ", ".join(parts) + "."
+        return f"Очищать нечего — активных дел {period} не нашлось 🙂"
+    return f"🧹 Очистил {period}: " + ", ".join(parts) + "."
 
 
 async def reschedule(session: AsyncSession, user: User, title: str, new_dt: datetime) -> str:

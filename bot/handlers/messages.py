@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 
 from aiogram import F, Router
@@ -17,9 +18,9 @@ from ..gemini import (
     parse_text,
     parse_voice,
 )
-from ..keyboards import MAIN_MENU, confirm_card
+from ..keyboards import confirm_card, view_footer
 from ..pending import PendingGroup, chat_groups, pop_group, put_group
-from ..views import cancel_plans, find_for_delete, reschedule, save_intent, today_view
+from ..views import cancel_plans, find_for_delete, goals_view, reschedule, save_intent, tasks_view, today_view
 from .. import giga, webdata
 
 log = logging.getLogger(__name__)
@@ -99,6 +100,10 @@ async def _handle_message(message: Message, parsed: ParsedMessage, raw_text: str
 
     for item in parsed.items:
         if item.intent == "delete":
+            bulk = _bulk_delete_target(item, raw_text)
+            if bulk:
+                await _handle_cancel_plans(message, item, target_override=bulk)
+                return
             await _handle_delete(message, item, raw_text)
             return
         if item.intent == "cancel_plans":
@@ -111,15 +116,88 @@ async def _handle_message(message: Message, parsed: ParsedMessage, raw_text: str
             await _handle_query(message, item, raw_text)
             return
 
+    # Страховка: «какие у меня цели / покажи задачи» — если парсер принял это за chat
+    kind = _list_request_kind(raw_text)
+    if kind:
+        await _send_list(message, kind)
+        return
+
     await _answer_chat(message, parsed, raw_text, tzname, hold_sent)
 
 
-async def _handle_cancel_plans(message: Message, item: ParsedIntent) -> None:
-    scope = item.scope or "today"
+LIST_ADD_WORDS = (
+    "запиши", "занеси", "добавь", "создай", "поставь", "новую цель", "новая цель",
+    "новую задачу", "хочу",
+)
+LIST_CUES = ("какие", "покажи", "список", "что у меня", "мои", "все мои", "есть ли")
+
+
+def _list_request_kind(text: str) -> str | None:
+    """«Какие у меня цели» / «покажи задачи» → 'goals' | 'tasks', иначе None."""
+    low = text.lower()
+    if any(w in low for w in LIST_ADD_WORDS):
+        return None
+    if not any(w in low for w in LIST_CUES):
+        return None
+    if re.search(r"цел", low):
+        return "goals"
+    if re.search(r"задач", low):
+        return "tasks"
+    return None
+
+
+BULK_GENERIC_TITLES = {
+    "", "все", "всё", "все цели", "все мои цели", "все задачи", "все мои задачи",
+    "все события", "все планы", "все мои планы", "все записи", "все дела",
+    "все мои дела", "все напоминания", "всё расписание", "все расписание",
+}
+
+
+def _bulk_target(text: str) -> str | None:
+    """«Удали все мои цели» / «очисти всё» → goals|tasks|events|all."""
+    low = text.lower()
+    has_goal = re.search(r"цел", low)
+    has_task = re.search(r"задач|дел[аи]\b", low)
+    has_event = re.search(r"событ|план|напоминан|запис", low)
+    if has_goal and (has_task or has_event):
+        return "all"
+    if has_goal:
+        return "goals"
+    if has_task:
+        return "tasks"
+    if has_event:
+        return "events"
+    if re.search(r"\bвс[её]\b", low):
+        return "all"
+    return None
+
+
+def _bulk_delete_target(item: ParsedIntent, raw_text: str) -> str | None:
+    """Массовое удаление через intent=delete, если без конкретного названия."""
+    title = (item.title or "").lower().strip()
+    if title and title not in BULK_GENERIC_TITLES:
+        return None
+    return _bulk_target(raw_text or title)
+
+
+async def _send_list(message: Message, kind: str) -> None:
     async with SessionLocal() as session:
         user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
-        text = await cancel_plans(session, user, scope)
-    await message.answer(text, reply_markup=MAIN_MENU)
+        if kind == "goals":
+            text, kb = await goals_view(session, user)
+            await message.answer(text, reply_markup=kb or view_footer())
+        else:
+            text = await tasks_view(session, user)
+            await message.answer(text, reply_markup=view_footer())
+
+
+async def _handle_cancel_plans(message: Message, item: ParsedIntent, target_override: str | None = None) -> None:
+    scope = item.scope or "all"
+    target = target_override or item.target or "all"
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
+        text = await cancel_plans(session, user, scope, target)
+    await message.answer(text, reply_markup=view_footer())
 
 
 async def _handle_reschedule(message: Message, item: ParsedIntent, raw_text: str, tzname: str) -> None:
@@ -131,7 +209,7 @@ async def _handle_reschedule(message: Message, item: ParsedIntent, raw_text: str
     async with SessionLocal() as session:
         user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
         text = await reschedule(session, user, title, new_dt)
-    await message.answer(text, reply_markup=MAIN_MENU)
+    await message.answer(text, reply_markup=view_footer())
 
 
 async def _handle_delete(message: Message, item: ParsedIntent, raw_text: str) -> None:
@@ -151,12 +229,16 @@ async def _handle_delete(message: Message, item: ParsedIntent, raw_text: str) ->
 
 async def _handle_query(message: Message, item: ParsedIntent, raw_text: str) -> None:
     low = raw_text.lower()
+    kind = _list_request_kind(raw_text)
+    if kind in ("goals", "tasks"):
+        await _send_list(message, kind)
+        return
     if any(w in low for w in ("сегодня", "день", "расписание", "план")):
         async with SessionLocal() as session:
             user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
-            await message.answer(await today_view(session, user), reply_markup=MAIN_MENU)
+            await message.answer(await today_view(session, user), reply_markup=view_footer())
     else:
-        await message.answer(item.answer or "Не совсем понял вопрос, уточните?", reply_markup=MAIN_MENU)
+        await message.answer(item.answer or "Не совсем понял вопрос, уточните?", reply_markup=view_footer())
 
 
 async def _race_hold(hold: asyncio.Task, main: asyncio.Task, message: Message) -> bool:
@@ -183,16 +265,16 @@ async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, t
                 chat_item.weather_hours or 3,
                 chat_item.weather_start_hours or 0,
             )
-            await message.answer(text, reply_markup=MAIN_MENU)
+            await message.answer(text, reply_markup=view_footer())
             return
         if chat_item and chat_item.currency:
             text = await webdata.get_rate(chat_item.currency, chat_item.currency_base or "RUB")
-            await message.answer(text, reply_markup=MAIN_MENU)
+            await message.answer(text, reply_markup=view_footer())
             return
     except Exception:
         log.exception("Weather/rate API failed")
         text = "Не смог получить данные, попробуйте ещё раз 🙏"
-        await message.answer(text, reply_markup=MAIN_MENU)
+        await message.answer(text, reply_markup=view_footer())
         return
 
     question = raw_text or parsed.transcript or parsed.answer or ""
@@ -214,7 +296,7 @@ async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, t
                 )
             else:
                 text = parsed.answer or "Не получилось найти ответ, попробуйте ещё раз 🙏"
-        await message.answer(text, reply_markup=MAIN_MENU)
+        await message.answer(text, reply_markup=view_footer())
         return
 
     hold = asyncio.create_task(hold_phrase())
@@ -231,7 +313,7 @@ async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, t
             )
         else:
             text = parsed.answer or "Не получилось найти ответ, попробуйте ещё раз 🙏"
-    await message.answer(text, reply_markup=MAIN_MENU)
+    await message.answer(text, reply_markup=view_footer())
 
 
 async def _confirm_pending(message: Message) -> None:
@@ -248,7 +330,7 @@ async def _confirm_pending(message: Message) -> None:
                 lines.append(await save_intent(session, user, intent, created_goals=created))
             contexts.append(group.text)
             pop_group(key)
-    await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
+    await message.answer("\n".join(lines), reply_markup=view_footer())
     from .callbacks import _spawn_goal_plans
 
     await _spawn_goal_plans(message, created, " ".join(contexts))
