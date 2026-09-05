@@ -115,7 +115,7 @@ async def goals_view(session: AsyncSession, user: User) -> tuple[str, InlineKeyb
     )
     if not goals:
         return "Целей пока нет. Расскажите, к чему стремитесь — я запомню!", None
-    lines = ["🎯 <b>Цели:</b>\nНажмите на цель, чтобы открыть её план 👇"]
+    lines = ["🎯 <b>Цели:</b>\nНажмите на цель, чтобы открыть карточку 👇"]
     for g in goals:
         target = f" (до {g.target_date.strftime('%d.%m.%Y')})" if g.target_date else ""
         lines.append(f"• {g.title}{target}")

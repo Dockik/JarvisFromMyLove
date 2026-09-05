@@ -74,7 +74,6 @@ def goal_actions(goal_id: int) -> InlineKeyboardMarkup:
 def goal_folder(goal_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Новый план", callback_data=f"gplan:{goal_id}")],
             [
                 InlineKeyboardButton(text="✅ Достигнута", callback_data=f"gl:done:{goal_id}"),
                 InlineKeyboardButton(text="🗑 Удалить", callback_data=f"gl:del:{goal_id}"),
@@ -93,12 +92,6 @@ def goals_kb(openable: list[tuple[int, str]]) -> InlineKeyboardMarkup | None:
             [InlineKeyboardButton(text=f"📂 {title[:28]}", callback_data=f"gopen:{gid}")]
             for gid, title in openable
         ]
-    )
-
-
-def subtask_done_kb(sub_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="✔️ Сделано", callback_data=f"sb:done:{sub_id}")]]
     )
 
 

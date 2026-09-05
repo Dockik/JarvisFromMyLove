@@ -19,7 +19,7 @@ from ..gemini import (
     parse_voice,
 )
 from ..keyboards import confirm_card, view_footer
-from ..pending import NAME_ASK, PLAN_ASK, PendingGroup, chat_groups, pop_group, put_group
+from ..pending import NAME_ASK, PendingGroup, chat_groups, pop_group, put_group
 from ..views import cancel_plans, find_for_delete, goals_view, reschedule, save_intent, tasks_view, today_view
 from .. import giga, webdata, pending
 
@@ -189,62 +189,6 @@ async def _send_list(message: Message, kind: str) -> None:
         else:
             text = await tasks_view(session, user)
             await message.answer(text, reply_markup=view_footer())
-
-
-WD_MAP = {"пн": 0, "вт": 1, "ср": 2, "чт": 3, "пт": 4, "сб": 5, "вс": 6}
-
-
-def _parse_plan_reply(text: str) -> tuple[int | None, set[int] | None, str | None]:
-    """«на 2 недели, пн-пт, в 20:00» → (14, {0..4}, "20:00")."""
-    low = text.lower()
-    days: int | None = None
-    m = re.search(r"(\d+)\s*недел", low)
-    if "месяц" in low:
-        days = 30
-    elif m:
-        days = min(60, max(1, int(m.group(1)) * 7))
-    elif re.search(r"недел", low):
-        days = 7
-    else:
-        m2 = re.search(r"(\d+)\s*дн", low)
-        if m2:
-            days = min(60, max(1, int(m2.group(1))))
-
-    weekdays: set[int] | None = None
-    rng = re.search(r"\b(пн|вт|ср|чт|пт|сб|вс)\s*[-–—]\s*(пн|вт|ср|чт|пт|сб|вс)\b", low)
-    if rng:
-        a, b = WD_MAP[rng.group(1)], WD_MAP[rng.group(2)]
-        weekdays = set(range(a, b + 1)) if a <= b else set(range(a, 7)) | set(range(0, b + 1))
-    else:
-        found = {WD_MAP[w] for w in re.findall(r"\b(пн|вт|ср|чт|пт|сб|вс)\b", low)}
-        if found and len(found) < 7:
-            weekdays = found
-
-    sub_time: str | None = None
-    mt = re.search(r"(\d{1,2})[:.](\d{2})", low)
-    if mt:
-        h, mm = int(mt.group(1)), int(mt.group(2))
-        if 0 <= h <= 23 and 0 <= mm <= 59:
-            sub_time = f"{h:02d}:{mm:02d}"
-    else:
-        mt = re.search(r"\bв\s+(\d{1,2})\b", low)
-        if mt and 0 <= int(mt.group(1)) <= 23:
-            sub_time = f"{int(mt.group(1)):02d}:00"
-    return days, weekdays, sub_time
-
-
-async def _handle_plan_reply(message: Message, user, items: list[tuple[int, str]], text: str) -> None:
-    days, weekdays, sub_time = _parse_plan_reply(text)
-    if days is None:
-        PLAN_ASK[message.chat.id] = items
-        await message.answer(
-            "Не понял срок 🤔 Напиши, например: «на неделю», "
-            "«на 2 недели, пн-пт» или «на месяц, в 20:00»."
-        )
-        return
-    from .callbacks import _generate_plans_for
-
-    await _generate_plans_for(message, items, days, weekdays, sub_time)
 
 
 async def _handle_cancel_plans(message: Message, item: ParsedIntent, target_override: str | None = None) -> None:
@@ -425,12 +369,6 @@ async def on_text(message: Message) -> None:
                 reply_markup=view_footer(),
             )
             return
-
-    # Бот ждёт срок плана по целям
-    if chat_id in PLAN_ASK and not text.startswith("/"):
-        items = PLAN_ASK.pop(chat_id)
-        await _handle_plan_reply(message, user, items, text)
-        return
 
     # Быстрое подтверждение/отмена карточек одним словом
     if low in CONFIRM_WORDS or low in CANCEL_WORDS:
