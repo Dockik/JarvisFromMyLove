@@ -24,11 +24,19 @@ def _parse_time(s: str) -> tuple[int, int]:
         return 18, 0
 
 
-async def create_goal_plan(session: AsyncSession, user: User, goal: Goal, context: str = "") -> str:
-    """Генерирует недельный план, сохраняет его и подзадачи. Возвращает текст карточки."""
-    plan = await generate_goal_plan(goal.title, context, goal.target_date, user.tz)
+async def create_goal_plan(
+    session: AsyncSession,
+    user: User,
+    goal: Goal,
+    context: str = "",
+    days: int = 7,
+    weekdays: set[int] | None = None,
+    sub_time: str | None = None,
+) -> str:
+    """Генерирует план на days дней, сохраняет его и подзадачи. Возвращает текст карточки."""
+    plan = await generate_goal_plan(goal.title, context, goal.target_date, user.tz, days=days, weekdays=weekdays)
     goal.plan = plan.plan
-    goal.plan_expires_at = utcnow() + timedelta(days=7)
+    goal.plan_expires_at = utcnow() + timedelta(days=max(1, days))
     goal.plan_gen_on = date.today()
 
     await session.execute(sa_delete(Subtask).where(Subtask.goal_id == goal.id))
@@ -39,7 +47,7 @@ async def create_goal_plan(session: AsyncSession, user: User, goal: Goal, contex
                 user_id=goal.user_id,
                 title=s.title,
                 weekday=s.weekday,
-                time_str=s.time,
+                time_str=sub_time or s.time,
             )
         )
     await session.commit()
@@ -58,7 +66,7 @@ async def goal_card_text(session: AsyncSession, goal: Goal, user: User) -> str:
     if goal.plan:
         expires = goal.plan_expires_at.astimezone(get_tz(user.tz)) if goal.plan_expires_at else None
         exp_str = expires.strftime("%d.%m") if expires else "?"
-        lines.append(f"\n📋 <b>План недели (до {exp_str}):</b>\n{goal.plan}")
+        lines.append(f"\n📋 <b>План (до {exp_str}):</b>\n{goal.plan}")
     if subtasks:
         lines.append("\n⏰ <b>Напоминания:</b>")
         for s in subtasks:

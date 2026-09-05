@@ -18,6 +18,11 @@ class PendingGroup:
 GROUPS: dict[str, PendingGroup] = {}
 BY_CHAT: dict[int, list[str]] = {}
 
+# Ждём ответ «как к тебе обращаться» (chat_id)
+NAME_ASK: set[int] = set()
+# Ждём срок плана по целям: chat_id -> [(goal_id, context)]
+PLAN_ASK: dict[int, list[tuple[int, str]]] = {}
+
 MAX_PENDING = 200
 
 

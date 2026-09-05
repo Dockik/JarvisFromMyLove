@@ -19,9 +19,9 @@ from ..gemini import (
     parse_voice,
 )
 from ..keyboards import confirm_card, view_footer
-from ..pending import PendingGroup, chat_groups, pop_group, put_group
+from ..pending import NAME_ASK, PLAN_ASK, PendingGroup, chat_groups, pop_group, put_group
 from ..views import cancel_plans, find_for_delete, goals_view, reschedule, save_intent, tasks_view, today_view
-from .. import giga, webdata
+from .. import giga, webdata, pending
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -191,6 +191,62 @@ async def _send_list(message: Message, kind: str) -> None:
             await message.answer(text, reply_markup=view_footer())
 
 
+WD_MAP = {"пн": 0, "вт": 1, "ср": 2, "чт": 3, "пт": 4, "сб": 5, "вс": 6}
+
+
+def _parse_plan_reply(text: str) -> tuple[int | None, set[int] | None, str | None]:
+    """«на 2 недели, пн-пт, в 20:00» → (14, {0..4}, "20:00")."""
+    low = text.lower()
+    days: int | None = None
+    m = re.search(r"(\d+)\s*недел", low)
+    if "месяц" in low:
+        days = 30
+    elif m:
+        days = min(60, max(1, int(m.group(1)) * 7))
+    elif re.search(r"недел", low):
+        days = 7
+    else:
+        m2 = re.search(r"(\d+)\s*дн", low)
+        if m2:
+            days = min(60, max(1, int(m2.group(1))))
+
+    weekdays: set[int] | None = None
+    rng = re.search(r"\b(пн|вт|ср|чт|пт|сб|вс)\s*[-–—]\s*(пн|вт|ср|чт|пт|сб|вс)\b", low)
+    if rng:
+        a, b = WD_MAP[rng.group(1)], WD_MAP[rng.group(2)]
+        weekdays = set(range(a, b + 1)) if a <= b else set(range(a, 7)) | set(range(0, b + 1))
+    else:
+        found = {WD_MAP[w] for w in re.findall(r"\b(пн|вт|ср|чт|пт|сб|вс)\b", low)}
+        if found and len(found) < 7:
+            weekdays = found
+
+    sub_time: str | None = None
+    mt = re.search(r"(\d{1,2})[:.](\d{2})", low)
+    if mt:
+        h, mm = int(mt.group(1)), int(mt.group(2))
+        if 0 <= h <= 23 and 0 <= mm <= 59:
+            sub_time = f"{h:02d}:{mm:02d}"
+    else:
+        mt = re.search(r"\bв\s+(\d{1,2})\b", low)
+        if mt and 0 <= int(mt.group(1)) <= 23:
+            sub_time = f"{int(mt.group(1)):02d}:00"
+    return days, weekdays, sub_time
+
+
+async def _handle_plan_reply(message: Message, user, items: list[tuple[int, str]], text: str) -> None:
+    days, weekdays, sub_time = _parse_plan_reply(text)
+    if days is None:
+        PLAN_ASK[message.chat.id] = items
+        await message.answer(
+            "Не понял срок 🤔 Напиши, например: «на неделю», "
+            "«на 2 недели, пн-пт» или «на месяц, в 20:00»."
+        )
+        return
+    from .callbacks import _generate_plans_for
+
+    await _generate_plans_for(message, items, days, weekdays, sub_time)
+
+
 async def _handle_cancel_plans(message: Message, item: ParsedIntent, target_override: str | None = None) -> None:
     scope = item.scope or "all"
     target = target_override or item.target or "all"
@@ -257,6 +313,10 @@ async def _race_hold(hold: asyncio.Task, main: asyncio.Task, message: Message) -
 async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, tzname: str, hold_sent: bool = False) -> None:
     chat_item = next((i for i in parsed.items if i.intent == "chat"), None)
 
+    async with SessionLocal() as session:
+        u = await get_or_create_user(session, message.from_user.id, message.from_user.username)
+    name = u.display_name or message.from_user.first_name or "друг"
+
     # Погода и курсы — через бесплатные API, без расхода квоты Gemini
     try:
         if chat_item and chat_item.weather_city:
@@ -280,7 +340,7 @@ async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, t
     question = raw_text or parsed.transcript or parsed.answer or ""
 
     async def _answer():
-        return await chat_answer(question, tzname)
+        return await chat_answer(question, tzname, name)
 
     answer_task = asyncio.create_task(_answer())
     if hold_sent:
@@ -299,7 +359,7 @@ async def _answer_chat(message: Message, parsed: ParsedMessage, raw_text: str, t
         await message.answer(text, reply_markup=view_footer())
         return
 
-    hold = asyncio.create_task(hold_phrase())
+    hold = asyncio.create_task(hold_phrase(name))
     await _race_hold(hold, answer_task, message)
     try:
         text = await answer_task
@@ -346,20 +406,43 @@ async def _cancel_pending(message: Message) -> None:
 async def on_text(message: Message) -> None:
     text = message.text or ""
     low = _norm(text)
+    chat_id = message.chat.id
+
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
+
+    # Бот спросил имя — следующий ответ и есть имя
+    if chat_id in NAME_ASK and not text.startswith("/"):
+        NAME_ASK.discard(chat_id)
+        name = text.strip().strip("«»\"'")[:40]
+        if name:
+            async with SessionLocal() as session:
+                u = await get_or_create_user(session, message.from_user.id, message.from_user.username)
+                u.display_name = name
+                await session.commit()
+            await message.answer(
+                f"Приятно познакомиться, {name}! 👋 Так и буду к тебе обращаться.",
+                reply_markup=view_footer(),
+            )
+            return
+
+    # Бот ждёт срок плана по целям
+    if chat_id in PLAN_ASK and not text.startswith("/"):
+        items = PLAN_ASK.pop(chat_id)
+        await _handle_plan_reply(message, user, items, text)
+        return
 
     # Быстрое подтверждение/отмена карточек одним словом
     if low in CONFIRM_WORDS or low in CANCEL_WORDS:
-        if chat_groups(message.chat.id):
+        if chat_groups(chat_id):
             if low in CONFIRM_WORDS:
                 await _confirm_pending(message)
             else:
                 await _cancel_pending(message)
             return
 
-    async with SessionLocal() as session:
-        user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
-
-    hold = asyncio.create_task(hold_phrase())
+    name = user.display_name or message.from_user.first_name or "друг"
+    hold = asyncio.create_task(hold_phrase(name))
     parse_task = asyncio.create_task(parse_text(text, user.tz))
     hold_sent = await _race_hold(hold, parse_task, message)
     try:
@@ -393,7 +476,7 @@ async def on_voice(message: Message) -> None:
         # 2) Gemini: расшифровка + разбор одним запросом
         return await parse_voice(ogg_bytes, user.tz), ""
 
-    hold = asyncio.create_task(hold_phrase())
+    hold = asyncio.create_task(hold_phrase(user.display_name or message.from_user.first_name or "друг"))
     parse_task = asyncio.create_task(_voice_parsed())
     hold_sent = await _race_hold(hold, parse_task, message)
     try:

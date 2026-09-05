@@ -61,6 +61,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     tg_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     tz: Mapped[str] = mapped_column(String(64), default="Europe/Moscow")
     digest_time: Mapped[str] = mapped_column(String(5), default="07:00")
     last_digest_date: Mapped[date | None] = mapped_column(nullable=True)
@@ -117,6 +118,7 @@ class Subtask(Base):
     weekday: Mapped[int] = mapped_column(Integer)  # 0=Пн .. 6=Вс
     time_str: Mapped[str] = mapped_column(String(5), default="18:00")
     last_reminded_on: Mapped[date | None] = mapped_column(nullable=True)
+    pre_reminded_on: Mapped[date | None] = mapped_column(nullable=True)
     done: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -142,12 +144,21 @@ async def init_db() -> None:
         await conn.execute(text("ALTER TABLE goals ADD COLUMN IF NOT EXISTS plan TEXT"))
         await conn.execute(text("ALTER TABLE goals ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ"))
         await conn.execute(text("ALTER TABLE goals ADD COLUMN IF NOT EXISTS plan_gen_on DATE"))
+        await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(64)"))
+        await conn.execute(text("ALTER TABLE subtasks ADD COLUMN IF NOT EXISTS pre_reminded_on DATE"))
 
 
-async def get_or_create_user(session: AsyncSession, tg_id: int, username: str | None) -> User:
+async def get_or_create_user(
+    session: AsyncSession, tg_id: int, username: str | None, first_name: str | None = None
+) -> User:
     user = await session.scalar(select(User).where(User.tg_id == tg_id))
     if user is None:
-        user = User(tg_id=tg_id, username=username, tz=settings.default_tz)
+        user = User(
+            tg_id=tg_id,
+            username=username,
+            display_name=(first_name or username or "")[:64] or None,
+            tz=settings.default_tz,
+        )
         session.add(user)
         await session.commit()
     return user

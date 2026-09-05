@@ -69,23 +69,43 @@ async def on_confirm(cb: CallbackQuery) -> None:
 
 
 async def _spawn_goal_plans(message, goals: list, context: str) -> None:
-    """После подтверждения цели тихо формирует недельный план и присылает карточку."""
+    """После подтверждения цели спрашивает срок плана и ждёт ответ пользователя."""
+    from .. import pending
+
+    if not goals:
+        return
+    pending.PLAN_ASK[message.chat.id] = [(g.id, context) for g in goals]
+    names = " и ".join(f"«{g.title}»" for g in goals)
+    await message.answer(
+        f"🎯 Цель {names} записана!\n\n"
+        "📅 На какой срок составить план? Напиши, например:\n"
+        "• «на неделю»\n"
+        "• «на 2 недели, пн-пт»\n"
+        "• «на месяц, в 20:00»\n\n"
+        "Можно указать дни недели и время напоминаний."
+    )
+
+
+async def _generate_plans_for(message, items: list[tuple[int, str]], days: int, weekdays, sub_time: str | None) -> None:
+    """Строит планы по целям после ответа пользователя о сроке."""
     from ..keyboards import goal_folder
 
-    for g in goals:
-        await message.answer("⏳ Формирую план по цели «%s»…" % g.title)
-        try:
-            async with SessionLocal() as session:
-                user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
-                goal = await session.get(Goal, g.id)
-                if goal is None:
-                    continue
-                text = await create_goal_plan(session, user, goal, context)
-        except Exception:
-            log.exception("Goal plan generation failed")
-            await message.answer("Не смог составить план — нажмите «🔄 Новый план» позже.")
-            continue
-        await message.answer(text, reply_markup=goal_folder(g.id))
+    for goal_id, context in items:
+        async with SessionLocal() as session:
+            user = await get_or_create_user(session, message.from_user.id, message.from_user.username)
+            goal = await session.get(Goal, goal_id)
+            if goal is None or goal.done:
+                continue
+            await message.answer(f"⏳ Составляю план на {days} дн. по цели «{goal.title}»…")
+            try:
+                text = await create_goal_plan(
+                    session, user, goal, context, days=days, weekdays=weekdays, sub_time=sub_time
+                )
+            except Exception:
+                log.exception("Goal plan generation failed")
+                await message.answer("Не смог составить план — нажмите «🔄 Новый план» позже.")
+                continue
+        await message.answer(text, reply_markup=goal_folder(goal.id))
 
 
 # ---------- Действия над существующими ----------

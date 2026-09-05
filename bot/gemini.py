@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import date, datetime
+import re
+from datetime import date, datetime, timedelta
 from typing import Literal, Optional
 
 from google import genai
@@ -67,43 +68,85 @@ class ParsedMessage(BaseModel):
 
 
 PLAN_RULES = """Ты — личный коуч-ассистент. Пользователь поставил цель. Составь КОНКРЕТНЫЙ план \
-на ближайшую неделю — готовый к исполнению «из коробки», а не общие советы.
+на {days_word} — готовый к исполнению «из коробки», а не общие советы.
 
 Жёсткие правила:
 - Используй КАЖДУЮ деталь из контекста пользователя (цифры, ограничения, предпочтения) — это требования, а не фон.
 - Каждый пункт — конкретное действие: не «сбалансированное меню на 1500 ккал», а \
-«Пн: завтрак — омлет из 3 яиц + овсянка 60 г (~450 ккал); обед — куриная грудка 150 г + гречка + овощи (~550 ккал)». \
-Не «занимайся языком», а «Пн: урок 1 — 50 базовых слов, 40 минут».
-- План ПО ДНЯМ недели: «Пн: …», «Вт: …» … Для диет — меню по приёмам пищи с блюдами и калориями; \
-для обучения — темы и длительность; для спорта — упражнения, подходы, минуты.
-- 6–12 строк. Без Markdown-заголовков и без общих фраз («следите за питанием», «регулярно занимайтесь»).
+«08.09: завтрак — омлет из 3 яиц + овсянка 60 г (~450 ккал); обед — куриная грудка 150 г + гречка + овощи (~550 ккал)». \
+Не «занимайся языком», а «08.09: урок 1 — 50 базовых слов, 40 минут».
+- План должен покрывать КАЖДЫЙ день из списка ниже — РОВНО {n_days} пунктов, по одному на день. \
+Каждый пункт с новой строки и начинается с даты этого дня в формате «ДД.ММ: …».
+- Для диет — меню по приёмам пищи с блюдами, граммами и калориями; для обучения — темы и длительность; \
+для спорта — упражнения, подходы, минуты.
+- Без Markdown-заголовков и без общих фраз («следите за питанием», «регулярно занимайтесь»).
 
+Дни плана (каждый обязан быть в плане): {dates}
 Цель: {title}
 Дедлайн: {target}
 Контекст пользователя: {context}
-Текущая дата: {now}, таймзона: {tz}. Планируй дни, которые ещё впереди на этой неделе."""
+Текущая дата: {now}, таймзона: {tz}."""
 
 # Для GigaChat: план обычным текстом (строгий JSON у GigaChat нестабилен)
 GIGA_PLAN_TEXT_PROMPT = PLAN_RULES + "\n\nВерни ТОЛЬКО сам текст плана, без JSON и без пояснений."
 
-GIGA_SUBTASKS_PROMPT = """Выбери из недельного плана 2-5 напоминаний. НЕ копируй строки плана — \
-придумай короткое действие-напоминание: например «Приготовить ужин по плану», \
-«Закупиться продуктами на неделю», «Взвеситься и записать вес», «Урок по плану: 40 минут».
+GIGA_SUBTASKS_PROMPT = """Выбери из недельного плана напоминания — ПО ОДНОМУ на каждый день плана \
+(НЕ копируй строки плана и примеры ниже — придумай СВОЁ короткое действие, подходящее к цели: \
+для диеты — готовка/закупки/взвешивание, для языка — урок/повторение слов, для спорта — тренировка).
+Время ОДИНАКОВОЕ для всех напоминаний.
 Верни ТОЛЬКО валидный JSON без текста вокруг: {{"subtasks": [{{"weekday": 0, "time": "19:00", "title": "..."}}]}}, \
-где weekday: 0=Пн..6=Вс, time "ЧЧ:ММ" (8:00-21:00). НЕ БОЛЬШЕ ОДНОЙ подзадачи на день.
+где weekday: 0=Пн..6=Вс, time "ЧЧ:ММ" (8:00-21:00). РОВНО {n_sub} подзадач, не больше одной на день недели.
 План:
 {plan}
-Сегодня: {now}, таймзона: {tz}. Бери только дни, которые ещё впереди на этой неделе."""
+Дни первой недели плана (только для них reminder): {dates}
+Сегодня: {now}, таймзона: {tz}."""
 
 # Для Gemini: тот же план, но сразу со схемой JSON
 GOAL_PLAN_PROMPT = PLAN_RULES + """
-Верни JSON: {{"plan": "текст плана", "subtasks": [{{"weekday": 0, "time": "19:00", "title": "короткое конкретное действие"}}]}}."""
+Верни JSON: {{"plan": "текст плана", "subtasks": [{{"weekday": 0, "time": "19:00", "title": "короткое конкретное действие"}}]}} \
+— по одной подзадаче на каждый день плана, время одинаковое."""
+
+
+WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def _plan_dates(user_tz: str, days: int, weekdays: set[int] | None) -> list[date]:
+    tz = get_tz(user_tz)
+    today = datetime.now(tz).date()
+    out: list[date] = []
+    for i in range(max(1, min(days, 60))):
+        d = today + timedelta(days=i)
+        if weekdays is None or d.weekday() in weekdays:
+            out.append(d)
+    return out
+
+
+def _days_word(days: int) -> str:
+    if days <= 1:
+        return "1 день"
+    if days <= 7 and days % 7 == 0:
+        return f"{days // 7} неделю" if days == 7 else f"{days // 7} недели"
+    if days < 7:
+        return f"{days} дней"
+    return f"{days} дней"
 
 
 async def generate_goal_plan(
-    title: str, context: str, target_date: date | None, user_tz: str
+    title: str,
+    context: str,
+    target_date: date | None,
+    user_tz: str,
+    days: int = 7,
+    weekdays: set[int] | None = None,
 ) -> "GoalPlan":
+    dates = _plan_dates(user_tz, days, weekdays)
+    dates_str = ", ".join(f"{WEEKDAYS_RU[d.weekday()]} {d.strftime('%d.%m')}" for d in dates)
+    first_week = dates[:7]
+    allowed_weekdays = {d.weekday() for d in first_week}
     fmt = dict(
+        days_word=_days_word(days),
+        n_days=len(dates),
+        dates=dates_str or "—",
         title=title,
         target=target_date.strftime("%d.%m.%Y") if target_date else "не указан",
         context=context or "нет",
@@ -116,24 +159,29 @@ async def generate_goal_plan(
                 await giga.chat(
                     [
                         {"role": "system", "content": GIGA_PLAN_TEXT_PROMPT.format(**fmt)},
-                        {"role": "user", "content": "Составь план недели."},
+                        {"role": "user", "content": "Составь план."},
                     ],
-                    max_tokens=1500,
+                    max_tokens=1500 if len(dates) <= 8 else 3000,
                 )
             ).strip()
             if plan_text:
+                sub_fmt = dict(
+                    n_sub=len(first_week),
+                    plan=plan_text[:3000],
+                    dates=", ".join(f"{WEEKDAYS_RU[d.weekday()]} {d.strftime('%d.%m')} (weekday={d.weekday()})" for d in first_week),
+                    now=fmt["now"],
+                    tz=user_tz,
+                )
                 sub_data = await giga.chat_json(
-                    GIGA_SUBTASKS_PROMPT.format(
-                        plan=plan_text[:3000], now=fmt["now"], tz=user_tz
-                    ),
+                    GIGA_SUBTASKS_PROMPT.format(**sub_fmt),
                     "Извлеки подзадачи из плана.",
-                    max_tokens=700,
+                    max_tokens=900,
                 )
                 parsed = GoalPlan(
                     plan=plan_text,
                     subtasks=[SubtaskPlan.model_validate(s) for s in sub_data.get("subtasks", [])],
                 )
-                return _sanitize_plan(parsed, user_tz)
+                return _sanitize_plan(parsed, user_tz, first_week)
         except Exception:
             log.warning("GigaChat goal plan failed, fallback to Gemini", exc_info=True)
     user_msg = GOAL_PLAN_PROMPT.format(**fmt)
@@ -150,7 +198,9 @@ async def generate_goal_plan(
                 ),
             )
             return _sanitize_plan(
-                GoalPlan.model_validate(json.loads(resp.text or "{}")), user_tz
+                GoalPlan.model_validate(json.loads(resp.text or "{}")),
+                user_tz,
+                first_week,
             )
         except Exception as e:  # noqa: BLE001
             last_exc = e
@@ -162,11 +212,18 @@ async def generate_goal_plan(
     raise last_exc
 
 
-def _sanitize_plan(parsed: "GoalPlan", user_tz: str) -> "GoalPlan":
-    """Нормализует подзадачи: валидные weekday/time, только будущие дни недели."""
+MENU_LINE_RE = re.compile(r"ккал|\d+\s*(?:г|мл|шт)\b", re.IGNORECASE)
+
+
+def _sanitize_plan(
+    parsed: "GoalPlan", user_tz: str, week_dates: list[date] | None = None
+) -> "GoalPlan":
+    """Нормализует подзадачи: валидные weekday/time, чистые названия, не больше одной на день."""
     tz = get_tz(user_tz)
     now = datetime.now(tz)
-    out = []
+    allowed_weekdays = {d.weekday() for d in week_dates} if week_dates else None
+    date_by_wd = {d.weekday(): d for d in week_dates} if week_dates else {}
+    out: list[SubtaskPlan] = []
     for s in parsed.subtasks:
         wd = s.weekday if 0 <= s.weekday <= 6 else 0
         t = s.time or "18:00"
@@ -177,22 +234,48 @@ def _sanitize_plan(parsed: "GoalPlan", user_tz: str) -> "GoalPlan":
             t = f"{h:02d}:{m:02d}"
         except ValueError:
             t = "18:00"
-        # Пропускаем дни недели, которые на этой неделе уже прошли (после текущего времени)
-        days_ahead = (wd - now.weekday()) % 7
-        if days_ahead == 0:
-            try:
-                hh, mm = map(int, t.split(":"))
-                if (hh, mm) <= (now.hour, now.minute):
-                    continue
-            except ValueError:
-                pass
-        elif days_ahead > 6:
-            continue
-        if s.title and s.title.strip():
-            out.append(SubtaskPlan(title=s.title.strip()[:200], weekday=wd, time=t))
+        if allowed_weekdays is not None:
+            if wd not in allowed_weekdays:
+                continue
+        else:
+            # Пропускаем дни недели, которые на этой неделе уже прошли (после текущего времени)
+            days_ahead = (wd - now.weekday()) % 7
+            if days_ahead == 0:
+                try:
+                    hh, mm = map(int, t.split(":"))
+                    if (hh, mm) <= (now.hour, now.minute):
+                        continue
+                except ValueError:
+                    pass
+            elif days_ahead > 6:
+                continue
+        title = (s.title or "").strip()[:200]
+        # Модель скопировала строку меню — заменяем чистым названием с датой
+        if not title or MENU_LINE_RE.search(title):
+            d = date_by_wd.get(wd)
+            title = (
+                f"По плану ({WEEKDAYS_RU[wd]} {d.strftime('%d.%m')})"
+                if d
+                else "По плану на этот день"
+            )
+        out.append(SubtaskPlan(title=title, weekday=wd, time=t))
     # Не больше одной подзадачи на день
     seen: set[int] = set()
     out = [s for s in out if s.weekday not in seen and not seen.add(s.weekday)]
+    # Автозаполнение: по одной подзадаче на каждый день первой недели
+    if allowed_weekdays:
+        times = [s.time for s in out]
+        common = max(set(times), key=times.count) if times else "19:00"
+        for wd in sorted(allowed_weekdays - seen):
+            d = date_by_wd.get(wd)
+            out.append(
+                SubtaskPlan(
+                    title=f"По плану ({WEEKDAYS_RU[wd]} {d.strftime('%d.%m')})" if d else "По плану на этот день",
+                    weekday=wd,
+                    time=common,
+                )
+            )
+    out.sort(key=lambda s: (s.weekday, s.time))
     return GoalPlan(plan=parsed.plan or "", subtasks=out)
 
 
@@ -242,8 +325,9 @@ weather_start_hours — через сколько часов от СЕЙЧАС �
 указанного «Текущее время», «послезавтра» — через два. Перед ответом сверь день и месяц.
 - Если ничего распознать не удалось — верни один item с intent=chat и пустым остальным."""
 
-CHAT_SYSTEM_PROMPT = """Ты — Джарвис, личный ассистент пользователя в Telegram. Отвечай по-русски: \
-дружелюбно, по делу и кратко (1–5 предложений), без таблиц и заголовков. \
+CHAT_SYSTEM_PROMPT = """Ты — Джарвис, личный ассистент пользователя в Telegram. Пользователя зовут {name} — \
+обращайся к нему по имени. Отвечай по-русски: дружелюбно, по делу и кратко (1–5 предложений), \
+без таблиц и заголовков. \
 {internet_rule} \
 Если спросили про погоду — напиши условия и температуру по часам на запрошенный период, будет ли нужен зонт. \
 Текущие дата и время: {now}. Таймзона пользователя: {tz}."""
@@ -257,10 +341,10 @@ def _system_prompt(user_tz: str) -> str:
     return SYSTEM_PROMPT.format(now=now, tz=user_tz)
 
 
-def _chat_system_prompt(user_tz: str, internet: bool = True) -> str:
+def _chat_system_prompt(user_tz: str, internet: bool = True, name: str = "") -> str:
     now = datetime.now(get_tz(user_tz)).isoformat(timespec="minutes")
     rule = INTERNET_ON if internet else INTERNET_OFF
-    return CHAT_SYSTEM_PROMPT.format(now=now, tz=user_tz, internet_rule=rule)
+    return CHAT_SYSTEM_PROMPT.format(now=now, tz=user_tz, internet_rule=rule, name=name or "друг")
 
 
 # Живые модели ключа (по списку API): 3.5-flash основная, дальше свежие 3.7
@@ -276,8 +360,6 @@ MODEL_CHAIN = [
 ]
 MAX_ROUNDS = 2
 RETRY_PAUSE_SEC = 3
-
-OWNER_NAME = "Данил"
 
 HOLD_PROMPT = (
     "Придумай ОДНУ короткую живую фразу (максимум 8 слов) от личного ассистента "
@@ -322,7 +404,7 @@ async def _generate(contents, user_tz: str) -> ParsedMessage:
     raise last_exc
 
 
-async def _gemini_chain(question: str, user_tz: str, use_search: bool) -> str:
+async def _gemini_chain(question: str, user_tz: str, use_search: bool, name: str = "") -> str:
     last_exc: Exception | None = None
     for round_no in range(MAX_ROUNDS):
         if round_no:
@@ -330,7 +412,7 @@ async def _gemini_chain(question: str, user_tz: str, use_search: bool) -> str:
         for model in MODEL_CHAIN:
             try:
                 config = types.GenerateContentConfig(
-                    system_instruction=_chat_system_prompt(user_tz, internet=use_search),
+                    system_instruction=_chat_system_prompt(user_tz, internet=use_search, name=name),
                     temperature=0.4,
                 )
                 if use_search:
@@ -354,13 +436,13 @@ async def _gemini_chain(question: str, user_tz: str, use_search: bool) -> str:
     raise last_exc
 
 
-async def chat_answer(question: str, user_tz: str) -> str:
+async def chat_answer(question: str, user_tz: str, name: str = "") -> str:
     """Свободное общение: GigaChat как живой ассистент, при сбое — Gemini (поиск → без поиска)."""
     if giga.enabled():
         try:
             answer = await giga.chat(
                 [
-                    {"role": "system", "content": _chat_system_prompt(user_tz, internet=False)},
+                    {"role": "system", "content": _chat_system_prompt(user_tz, internet=False, name=name)},
                     {"role": "user", "content": question},
                 ]
             )
@@ -369,18 +451,18 @@ async def chat_answer(question: str, user_tz: str) -> str:
         except Exception:
             log.warning("GigaChat chat failed, fallback to Gemini search", exc_info=True)
     try:
-        return await _gemini_chain(question, user_tz, use_search=True)
+        return await _gemini_chain(question, user_tz, use_search=True, name=name)
     except Exception as e:
         if getattr(e, "code", None) != 429:
             raise
         # Квота поиска исчерпана — пробуем обычную генерацию (у неё отдельная квота)
         log.warning("Gemini search quota exhausted, retrying without search")
-        return await _gemini_chain(question, user_tz, use_search=False)
+        return await _gemini_chain(question, user_tz, use_search=False, name=name)
 
 
-async def hold_phrase() -> str | None:
+async def hold_phrase(name: str = "друг") -> str | None:
     """Живая фраза «уже работаю над этим» — генерируется отдельно, чтобы не быть шаблонной."""
-    prompt = HOLD_PROMPT.format(name=OWNER_NAME)
+    prompt = HOLD_PROMPT.format(name=name or "друг")
     if giga.enabled():
         try:
             text = (await giga.chat(

@@ -85,6 +85,23 @@ async def check_digests(bot: Bot) -> None:
 
 async def _digest_text(session: AsyncSession, user: User) -> str:
     text = await today_view(session, user)
+    local_now = datetime.now(get_tz(user.tz))
+    rows = list(
+        await session.execute(
+            select(Subtask, Goal)
+            .join(Goal, Subtask.goal_id == Goal.id)
+            .where(
+                Subtask.user_id == user.id,
+                Subtask.done.is_(False),
+                Goal.done.is_(False),
+                Subtask.weekday == local_now.weekday(),
+            )
+            .order_by(Subtask.time_str)
+        )
+    )
+    if rows:
+        lines = [f"• {s.time_str} — {s.title} (цель «{g.title}»)" for s, g in rows]
+        text += "\n\n🎯 <b>Цели на сегодня:</b>\n" + "\n".join(lines)
     return "☀️ Доброе утро!\n\n" + text
 
 
@@ -95,7 +112,7 @@ def _digest_kb() -> InlineKeyboardMarkup:
 
 
 async def check_goal_subtasks(bot: Bot) -> None:
-    """Напоминания подзадач цели в выбранный день/время + автопродление недельного плана."""
+    """Напоминания подзадач цели: за час и в назначенное время + автопродление плана."""
     async with SessionLocal() as session:
         rows = list(
             await session.execute(
@@ -111,6 +128,24 @@ async def check_goal_subtasks(bot: Bot) -> None:
             local_now = datetime.now(get_tz(user.tz))
             if sub.weekday != local_now.weekday():
                 continue
+            # Напоминание ЗА ЧАС до времени подзадачи
+            try:
+                h, m = map(int, sub.time_str.split(":"))
+            except ValueError:
+                h, m = 18, 0
+            occurs_at = local_now.replace(hour=h, minute=m, second=0, microsecond=0)
+            mins_left = (occurs_at - local_now).total_seconds() / 60
+            if sub.pre_reminded_on != local_now.date() and 0 < mins_left <= 60:
+                sub.pre_reminded_on = local_now.date()
+                try:
+                    await bot.send_message(
+                        user.tg_id,
+                        f"⏰ Через час: <b>{sub.title}</b>\n🎯 Цель «{goal.title}»",
+                        reply_markup=subtask_done_kb(sub.id),
+                    )
+                except Exception:
+                    log.exception("Subtask pre-reminder failed for %s", user.tg_id)
+            # Напоминание В НАЗНАЧЕННОЕ ВРЕМЯ
             if sub.time_str > local_now.strftime("%H:%M"):
                 continue
             if sub.last_reminded_on == local_now.date():
@@ -124,7 +159,7 @@ async def check_goal_subtasks(bot: Bot) -> None:
                 )
             except Exception:
                 log.exception("Subtask reminder failed for %s", user.tg_id)
-            # План недели истёк? Планируем автопродление (раз в день)
+            # План истёк? Планируем автопродление (раз в день)
             if (
                 goal.plan_expires_at is not None
                 and _aware(goal.plan_expires_at) < now_utc
