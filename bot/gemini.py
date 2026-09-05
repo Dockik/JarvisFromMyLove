@@ -64,9 +64,9 @@ def _config(user_tz: str) -> types.GenerateContentConfig:
     )
 
 
-# Основная модель + запасные: при перегрузке (503) или квоте (429)
-# пробуем следующую, чтобы ответ пользователю не срывался
-MODEL_CHAIN = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
+# Порядок: стабильная 3.5 первой, перегруженная 3.6 и легаси 2.5 — запасные.
+# При 429/5xx (перегрузка, квота, дедлайн) пробуем следующую модель.
+MODEL_CHAIN = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-2.5-flash"]
 
 
 async def _generate(contents, user_tz: str) -> ParsedIntent:
@@ -82,7 +82,7 @@ async def _generate(contents, user_tz: str) -> ParsedIntent:
         except Exception as e:  # noqa: BLE001
             code = getattr(e, "code", None)
             last_exc = e
-            if code in (429, 500, 503):
+            if code in (429, 500, 502, 503, 504):
                 log.warning("Gemini %s failed (%s), trying next model", model, code)
                 continue
             raise
