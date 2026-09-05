@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -85,15 +86,28 @@ def _chat_system_prompt(user_tz: str) -> str:
     return CHAT_SYSTEM_PROMPT.format(now=now, tz=user_tz)
 
 
-# Живые модели ключа (по списку API): 3.5-flash основная, дальше свежие 3.7/3.8
-# и облегчённая 3.5-lite. 2.5-flash для новых ключей закрыт (404), 3.6 сегодня
-# стабильно перегружен. При 429/5xx пробуем следующую модель.
+# Живые модели ключа (по списку API): 3.5-flash основная, дальше свежие 3.7
+# и облегчённые lite (реже перегружены). 2.5-flash для новых ключей закрыт (404),
+# 3.6 стабильно перегружен. При 429/5xx идём к следующей модели; если упала вся
+# цепочка — второй круг с паузой.
 MODEL_CHAIN = [
     "gemini-3.5-flash",
     "gemini-3.7-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
 ]
+MAX_ROUNDS = 2
+RETRY_PAUSE_SEC = 3
+
+OWNER_NAME = "Данил"
+
+HOLD_PROMPT = (
+    "Придумай ОДНУ короткую живую фразу (максимум 8 слов) от личного ассистента "
+    "для пользователя по имени {name}. Смысл фразы: «взял запрос в работу, уже разбираюсь». "
+    "Тёплая, слегка неформальная, можно один эмодзи. Каждый раз разная. "
+    "Без кавычек — только сама фраза."
+)
 
 
 def _is_retryable(e: Exception) -> bool:
@@ -102,25 +116,31 @@ def _is_retryable(e: Exception) -> bool:
 
 async def _generate(contents, user_tz: str) -> ParsedMessage:
     last_exc: Exception | None = None
-    for model in MODEL_CHAIN:
-        try:
-            resp = await client.aio.models.generate_content(
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=_system_prompt(user_tz),
-                    response_mime_type="application/json",
-                    response_schema=ParsedMessage,
-                    temperature=0.2,
-                ),
-            )
-            return _parse(resp)
-        except Exception as e:  # noqa: BLE001
-            last_exc = e
-            if _is_retryable(e):
-                log.warning("Gemini %s failed (%s), trying next model", model, getattr(e, "code", None))
-                continue
-            raise
+    for round_no in range(MAX_ROUNDS):
+        if round_no:
+            await asyncio.sleep(RETRY_PAUSE_SEC)
+        for model in MODEL_CHAIN:
+            try:
+                resp = await client.aio.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=_system_prompt(user_tz),
+                        response_mime_type="application/json",
+                        response_schema=ParsedMessage,
+                        temperature=0.2,
+                    ),
+                )
+                return _parse(resp)
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                if _is_retryable(e):
+                    log.warning(
+                        "Gemini %s failed (%s), round %s, trying next model",
+                        model, getattr(e, "code", None), round_no + 1,
+                    )
+                    continue
+                raise
     assert last_exc is not None
     raise last_exc
 
@@ -128,26 +148,51 @@ async def _generate(contents, user_tz: str) -> ParsedMessage:
 async def chat_answer(question: str, user_tz: str) -> str:
     """Ответ на свободный вопрос с поиском Google (погода, курсы и т.п.)."""
     last_exc: Exception | None = None
-    for model in MODEL_CHAIN:
-        try:
-            resp = await client.aio.models.generate_content(
-                model=model,
-                contents=question,
-                config=types.GenerateContentConfig(
-                    system_instruction=_chat_system_prompt(user_tz),
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                    temperature=0.4,
-                ),
-            )
-            return (resp.text or "").strip() or "Не нашёл ответа, попробуйте уточнить вопрос 🙏"
-        except Exception as e:  # noqa: BLE001
-            last_exc = e
-            if _is_retryable(e):
-                log.warning("Gemini chat %s failed (%s), trying next model", model, getattr(e, "code", None))
-                continue
-            raise
+    for round_no in range(MAX_ROUNDS):
+        if round_no:
+            await asyncio.sleep(RETRY_PAUSE_SEC)
+        for model in MODEL_CHAIN:
+            try:
+                resp = await client.aio.models.generate_content(
+                    model=model,
+                    contents=question,
+                    config=types.GenerateContentConfig(
+                        system_instruction=_chat_system_prompt(user_tz),
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                        temperature=0.4,
+                    ),
+                )
+                return (resp.text or "").strip() or "Не нашёл ответа, попробуйте уточнить вопрос 🙏"
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                if _is_retryable(e):
+                    log.warning(
+                        "Gemini chat %s failed (%s), round %s, trying next model",
+                        model, getattr(e, "code", None), round_no + 1,
+                    )
+                    continue
+                raise
     assert last_exc is not None
     raise last_exc
+
+
+async def hold_phrase() -> str | None:
+    """Живая фраза «уже работаю над этим» — генерируется отдельно, чтобы не быть шаблонной."""
+    try:
+        resp = await client.aio.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=HOLD_PROMPT.format(name=OWNER_NAME),
+            config=types.GenerateContentConfig(
+                temperature=1.0,
+                max_output_tokens=60,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = (resp.text or "").strip().strip('"«»').strip()
+        return text or None
+    except Exception:  # noqa: BLE001
+        log.warning("hold_phrase failed", exc_info=True)
+        return None
 
 
 async def parse_text(text: str, user_tz: str) -> ParsedMessage:

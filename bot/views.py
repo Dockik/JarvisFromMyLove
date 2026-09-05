@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -116,6 +116,64 @@ async def goals_view(session: AsyncSession, user: User) -> str:
         target = f" (до {g.target_date.strftime('%d.%m.%Y')})" if g.target_date else ""
         lines.append(f"• {g.title}{target}")
     return "\n".join(lines)
+
+
+async def save_intent(session: AsyncSession, user: User, intent) -> str:
+    """Сохраняет распознанное действие в БД. Возвращает строку-отчёт для чата."""
+    if intent.intent == "add_event":
+        dt = None
+        if intent.starts_at:
+            s = intent.starts_at.replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(s)
+            except ValueError:
+                dt = None
+            if dt and dt.tzinfo is None:
+                dt = dt.replace(tzinfo=get_tz(user.tz))
+        if dt is None:
+            return f"⚠️ Не распознал время события «{intent.title or '?'}» — напишите его ещё раз с временем."
+        ev = Event(
+            user_id=user.id,
+            title=intent.title or "Событие",
+            starts_at=dt.astimezone(timezone.utc),
+            remind_before_min=intent.remind_before_minutes or 60,
+            notes=intent.answer,
+        )
+        session.add(ev)
+        await session.commit()
+        return f"📌 Событие сохранено: <b>{ev.title}</b>"
+
+    if intent.intent == "add_task":
+        due = None
+        if intent.due_at:
+            s = intent.due_at.replace("Z", "+00:00")
+            try:
+                due = datetime.fromisoformat(s).astimezone(timezone.utc)
+            except ValueError:
+                due = None
+        tk = Task(
+            user_id=user.id,
+            title=intent.title or "Задача",
+            due_at=due,
+            priority=intent.priority or "normal",
+        )
+        session.add(tk)
+        await session.commit()
+        return f"✅ Задача добавлена: <b>{tk.title}</b>"
+
+    if intent.intent == "add_goal":
+        td = None
+        if intent.target_date:
+            try:
+                td = date.fromisoformat(intent.target_date)
+            except ValueError:
+                td = None
+        gl = Goal(user_id=user.id, title=intent.title or "Цель", target_date=td)
+        session.add(gl)
+        await session.commit()
+        return f"🎯 Цель записана: <b>{gl.title}</b>"
+
+    return f"⚠️ Не понял, что сохранять ({intent.intent})."
 
 
 async def find_for_delete(session: AsyncSession, user: User, title: str) -> list[tuple[str, int, str]]:
